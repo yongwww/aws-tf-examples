@@ -14,7 +14,7 @@ python tensorflow_image_resizer.py -i /path/to/imagenet-full-tfrecord/ -o /path/
 ### Train model using the prepared dataset
 
 ```
-python ./cnn/nvcnn_new.py
+python ./cnn/nvcnn.py
  --num_epochs=90
  --batch_size=256
  --display_every 100
@@ -27,7 +27,7 @@ python ./cnn/nvcnn_new.py
 
 ### Evaluate (Top-1 and Top-5 validation accuracy)
 ```
-python ./cnn/nvcnn_new.py
+python ./cnn/nvcnn.py
  --num_epochs=90
  --batch_size=256
  --display_every 100
