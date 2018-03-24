@@ -1,1287 +1,1433 @@
+#!/usr/bin/env python
+# Copyright 2016 The TensorFlow Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+"""
+Changelog:
+1.1
+  - Center crop evaluation images
+  - Enable LARC learning rate control
+  - Correctly order UPDATE_OPS and global_step update during training.
+  - Set default learning rate policy to polynomial decay.
+  - Add cmd line options for checkpoint and summary intervals.
+  - Add loss scaling.
+  - Scale resnet learning rate by batch size.
+1.0
+  - Initial version based on nvcnn.py 1.4
+"""
+
+from __future__ import print_function
+from builtins import range
+
+import numpy as np
+import tensorflow as tf
+from tensorflow.python.ops import data_flow_ops
+from tensorflow.python.ops import init_ops
+
+import sys
+import os
+import time
+import math
+from collections import defaultdict
+import argparse
+
+try:
+    import horovod.tensorflow as hvd
+except:
+    print("Failed to import horovod module. "
+          "%s is intended for use with Uber's Horovod distributed training "
+          "framework. To create a Docker image with Horovod support see "
+          "docker-examples/Dockerfile.horovod." % __file__)
+    raise
+
+__version__ = "1.0"
+
+def tensorflow_version_tuple():
+    v = tf.__version__
+    major, minor, patch = v.split('.')
+    return (int(major), int(minor), patch)
+
+hvd.init()
+
+def print_r0(*args, **kwargs):
+    if hvd.rank() == 0:
+        print(*args, **kwargs)
+
+def float32_variable_storage_getter(getter, name, shape=None, dtype=None,
+                                    initializer=None, regularizer=None,
+                                    trainable=True,
+                                    *args, **kwargs):
+    storage_dtype = tf.float32 if trainable else dtype
+    variable = getter(name, shape, dtype=storage_dtype,
+                      initializer=initializer, regularizer=regularizer,
+                      trainable=trainable,
+                      *args, **kwargs)
+    if trainable and dtype != tf.float32:
+        variable = tf.cast(variable, dtype)
+    return variable
+
+class GPUNetworkBuilder(object):
+    """This class provides convenient methods for constructing feed-forward
+    networks with internal data layout of 'NCHW'.
+    """
+    def __init__(self,
+                 is_training,
+                 dtype=tf.float32,
+                 activation='RELU',
+                 use_batch_norm=True,
+                 batch_norm_config = {'decay':   0.9,
+                                      'epsilon': 1e-4,
+                                      'scale':   True,
+                                      'zero_debias_moving_mean': False}):
+        self.dtype             = dtype
+        self.activation_func   = activation
+        self.is_training       = is_training
+        self.use_batch_norm    = use_batch_norm
+        self.batch_norm_config = batch_norm_config
+        self._layer_counts     = defaultdict(lambda: 0)
+    def _count_layer(self, layer_type):
+        idx  = self._layer_counts[layer_type]
+        name = layer_type + str(idx)
+        self._layer_counts[layer_type] += 1
+        return name
+    def _get_variable(self, name, shape, dtype=None,
+                      initializer=None, seed=None):
+        if dtype is None:
+            dtype = self.dtype
+        if initializer is None:
+            initializer = init_ops.glorot_uniform_initializer(seed=seed)
+        elif (isinstance(initializer, float) or
+              isinstance(initializer, int)):
+            initializer = tf.constant_initializer(float(initializer))
+        return tf.get_variable(name, shape, dtype, initializer)
+    def _to_nhwc(self, x):
+        return tf.transpose(x, [0,2,3,1])
+    def _from_nhwc(self, x):
+        return tf.transpose(x, [0,3,1,2])
+    def _bias(self, input_layer):
+        num_outputs = input_layer.get_shape().as_list()[1]
+        biases = self._get_variable('biases', [num_outputs], input_layer.dtype,
+                                    initializer=0)
+        if len(input_layer.get_shape()) == 4:
+            return tf.nn.bias_add(input_layer, biases,
+                                  data_format='NCHW')
+        else:
+            return input_layer + biases
+    def _batch_norm(self, input_layer, scope):
+        return tf.contrib.layers.batch_norm(input_layer,
+                                            is_training=self.is_training,
+                                            scope=scope,
+                                            data_format='NCHW',
+                                            fused=True,
+                                            **self.batch_norm_config)
+    def _bias_or_batch_norm(self, input_layer, scope, use_batch_norm):
+        if use_batch_norm is None:
+            use_batch_norm = self.use_batch_norm
+        if use_batch_norm:
+            return self._batch_norm(input_layer, scope)
+        else:
+            return self._bias(input_layer)
+    def input_layer(self, input_layer):
+        """Converts input data into the internal format"""
+        x = self._from_nhwc(input_layer)
+        x = tf.cast(x, self.dtype)
+        # Rescale and shift to [-1,1]
+        x = x * (1./127.5) - 1
+        return x
+    def conv(self, input_layer, num_filters, filter_size,
+             filter_strides=(1,1), padding='SAME',
+             activation=None, use_batch_norm=None):
+        """Applies a 2D convolution layer that includes bias or batch-norm
+        and an activation function.
+        """
+        num_inputs = input_layer.get_shape().as_list()[1]
+        kernel_shape = [filter_size[0], filter_size[1],
+                        num_inputs, num_filters]
+        strides = [1, 1, filter_strides[0], filter_strides[1]]
+        with tf.variable_scope(self._count_layer('conv')) as scope:
+            kernel = self._get_variable('weights', kernel_shape,
+                                        input_layer.dtype)
+            if padding == 'SAME_RESNET': # ResNet models require custom padding
+                kh, kw = filter_size
+                rate = 1
+                kernel_size_effective = kh + (kw - 1) * (rate - 1)
+                pad_total = kernel_size_effective - 1
+                pad_beg = pad_total // 2
+                pad_end = pad_total - pad_beg
+                padding = [[0, 0], [0, 0],
+                           [pad_beg, pad_end], [pad_beg, pad_end]]
+                input_layer = tf.pad(input_layer, padding)
+                padding = 'VALID'
+            x = tf.nn.conv2d(input_layer, kernel, strides,
+                             padding=padding, data_format='NCHW')
+            x = self._bias_or_batch_norm(x, scope, use_batch_norm)
+            x = self.activate(x, activation)
+            return x
+    def deconv(self, input_layer, num_filters, filter_size,
+               filter_strides=(2,2), padding='SAME',
+               activation=None, use_batch_norm=None):
+        """Applies a 'transposed convolution' layer that includes bias or
+        batch-norm and an activation function.
+        """
+        num_inputs  = input_layer.get_shape().as_list()[1]
+        ih, iw      = input_layer.get_shape().as_list()[2:]
+        output_shape = [-1, num_filters,
+                        ih*filter_strides[0], iw*filter_strides[1]]
+        kernel_shape = [filter_size[0], filter_size[1],
+                        num_filters, num_inputs]
+        strides = [1, 1, filter_strides[0], filter_strides[1]]
+        with tf.variable_scope(self._count_layer('deconv')) as scope:
+            kernel = self._get_variable('weights', kernel_shape,
+                                        input_layer.dtype)
+            x = tf.nn.conv2d_transpose(input_layer, kernel, output_shape,
+                                       strides, padding=padding,
+                                       data_format='NCHW')
+            x = self._bias_or_batch_norm(x, scope, use_batch_norm)
+            x = self.activate(x, activation)
+            return x
+    def activate(self, input_layer, funcname=None):
+        """Applies an activation function"""
+        if isinstance(funcname, tuple):
+            funcname = funcname[0]
+            params = funcname[1:]
+        if funcname is None:
+            funcname = self.activation_func
+        if funcname == 'LINEAR':
+            return input_layer
+        activation_map = {
+            'RELU':    tf.nn.relu,
+            'RELU6':   tf.nn.relu6,
+            'ELU':     tf.nn.elu,
+            'SIGMOID': tf.nn.sigmoid,
+            'TANH':    tf.nn.tanh,
+            'LRELU':   lambda x, name: tf.maximum(params[0]*x, x, name=name)
+        }
+        return activation_map[funcname](input_layer, name=funcname.lower())
+    def pool(self, input_layer, funcname, window_size,
+                 window_strides=(2,2),
+                 padding='VALID'):
+        """Applies spatial pooling"""
+        pool_map = {
+            'MAX': tf.nn.max_pool,
+            'AVG': tf.nn.avg_pool
+        }
+        kernel_size    = [1, 1, window_size[0], window_size[1]]
+        kernel_strides = [1, 1, window_strides[0], window_strides[1]]
+        return pool_map[funcname](input_layer, kernel_size, kernel_strides,
+                                  padding, data_format='NCHW',
+                                  name=funcname.lower())
+    def project(self, input_layer, num_outputs, height, width,
+                activation=None):
+        """Linearly projects to an image-like tensor"""
+        with tf.variable_scope(self._count_layer('project')):
+            x = self.fully_connected(input_layer, num_outputs*height*width,
+                                     activation=activation)
+            x = tf.reshape(x, [-1, num_outputs, height, width])
+            return x
+    def flatten(self, input_layer):
+        """Flattens the spatial and channel dims into a single dim (4D->2D)"""
+        # Note: This ensures the output order matches that of NHWC networks
+        input_layer = self._to_nhwc(input_layer)
+        input_shape = input_layer.get_shape().as_list()
+        num_inputs  = input_shape[1]*input_shape[2]*input_shape[3]
+        return tf.reshape(input_layer, [-1, num_inputs], name='flatten')
+    def spatial_avg(self, input_layer):
+        """Averages over spatial dimensions (4D->2D)"""
+        return tf.reduce_mean(input_layer, [2, 3], name='spatial_avg')
+    def fully_connected(self, input_layer, num_outputs, activation=None):
+        """Applies a fully-connected set of weights"""
+        num_inputs = input_layer.get_shape().as_list()[1]
+        kernel_size = [num_inputs, num_outputs]
+        with tf.variable_scope(self._count_layer('fully_connected')):
+            kernel = self._get_variable('weights', kernel_size,
+                                        input_layer.dtype)
+            x = tf.matmul(input_layer, kernel)
+            x = self._bias(x)
+            x = self.activate(x, activation)
+            return x
+    def inception_module(self, input_layer, name, cols):
+        """Applies an inception module with a given form"""
+        with tf.name_scope(name):
+            col_layers      = []
+            col_layer_sizes = []
+            for c, col in enumerate(cols):
+                col_layers.append([])
+                col_layer_sizes.append([])
+                x = input_layer
+                for l, layer in enumerate(col):
+                    ltype, args = layer[0], layer[1:]
+                    if   ltype == 'conv': x = self.conv(x, *args)
+                    elif ltype == 'pool': x = self.pool(x, *args)
+                    elif ltype == 'share':
+                        # Share matching layer from previous column
+                        x = col_layers[c-1][l]
+                    else: raise KeyError("Invalid layer type for " +
+                                         "inception module: '%s'" % ltype)
+                    col_layers[c].append(x)
+            catdim  = 1
+            catvals = [layers[-1] for layers in col_layers]
+            x = tf.concat(catvals, catdim)
+            return x
+    def residual(self, input_layer, net, scale=1.0, activation='RELU'):
+        """Applies a residual layer"""
+        input_size     = input_layer.get_shape().as_list()
+        num_inputs     = input_size[1]
+        output_layer   = scale*net(self, input_layer)
+        output_size    = output_layer.get_shape().as_list()
+        num_outputs    = output_size[1]
+        kernel_strides = (input_size[2]//output_size[2],
+                          input_size[3]//output_size[3])
+        with tf.name_scope('residual'):
+            if (num_outputs != num_inputs or
+                kernel_strides[0] != 1 or
+                kernel_strides[1] != 1):
+                input_layer = self.conv(input_layer, num_outputs, [1, 1],
+                                        kernel_strides, activation='LINEAR')
+            x = self.activate(input_layer + output_layer, activation)
+            return x
+    def dropout(self, input_layer, keep_prob=0.5):
+        """Applies a dropout layer if is_training"""
+        if self.is_training:
+            dtype = input_layer.dtype
+            with tf.variable_scope(self._count_layer('dropout')):
+                keep_prob_tensor = tf.constant(keep_prob, dtype=dtype)
+                return tf.nn.dropout(input_layer, keep_prob_tensor)
+        else:
+            return input_layer
+
+def deserialize_image_record(record):
+    feature_map = {
+        'image/encoded':          tf.FixedLenFeature([ ], tf.string, ''),
+        'image/class/label':      tf.FixedLenFeature([1], tf.int64,  -1),
+        'image/class/text':       tf.FixedLenFeature([ ], tf.string, ''),
+        'image/object/bbox/xmin': tf.VarLenFeature(dtype=tf.float32),
+        'image/object/bbox/ymin': tf.VarLenFeature(dtype=tf.float32),
+        'image/object/bbox/xmax': tf.VarLenFeature(dtype=tf.float32),
+        'image/object/bbox/ymax': tf.VarLenFeature(dtype=tf.float32)
+    }
+    with tf.name_scope('deserialize_image_record'):
+        obj = tf.parse_single_example(record, feature_map)
+        imgdata = obj['image/encoded']
+        label   = tf.cast(obj['image/class/label'], tf.int32)
+        bbox    = tf.stack([obj['image/object/bbox/%s'%x].values
+                            for x in ['ymin', 'xmin', 'ymax', 'xmax']])
+        bbox = tf.transpose(tf.expand_dims(bbox, 0), [0,2,1])
+        text    = obj['image/class/text']
+        return imgdata, label, bbox, text
+
+def decode_jpeg(imgdata, channels=3):
+    return tf.image.decode_jpeg(imgdata, channels=channels,
+                                fancy_upscaling=False,
+                                dct_method='INTEGER_FAST')
+
+def decode_png(imgdata, channels=3):
+    return tf.image.decode_png(imgdata, channels=channels)
+
+def random_crop_and_resize_image(image, bbox, height, width):
+    with tf.name_scope('random_crop_and_resize'):
+        if FLAGS.eval:
+            image = tf.image.central_crop(image, 224./256.)
+        else:
+            bbox_begin, bbox_size, distorted_bbox = tf.image.sample_distorted_bounding_box(
+                tf.shape(image),
+                bounding_boxes=bbox,
+                min_object_covered=0.1,
+                aspect_ratio_range=[0.8, 1.25],
+                area_range=[0.1, 1.0],
+                max_attempts=100,
+                use_image_if_no_bounding_boxes=True)
+            # Crop the image to the distorted bounding box
+            image = tf.slice(image, bbox_begin, bbox_size)
+        # Resize to the desired output size
+        image = tf.image.resize_images(
+            image,
+            [height, width],
+            tf.image.ResizeMethod.BILINEAR,
+            align_corners=False)
+        image.set_shape([height, width, 3])
+        return image
+
+def distort_image_color(image, order):
+    with tf.name_scope('distort_color'):
+        image /= 255.
+        brightness = lambda img: tf.image.random_brightness(img, max_delta=32. / 255.)
+        saturation = lambda img: tf.image.random_saturation(img, lower=0.5, upper=1.5)
+        hue        = lambda img: tf.image.random_hue(img, max_delta=0.2)
+        contrast   = lambda img: tf.image.random_contrast(img, lower=0.5, upper=1.5)
+        if order == 0: ops = [brightness, saturation, hue, contrast]
+        else:          ops = [brightness, contrast, saturation, hue]
+        for op in ops:
+            image = op(image)
+        # The random_* ops do not necessarily clamp the output range
+        image = tf.clip_by_value(image, 0.0, 1.0)
+        # Restore the original scaling
+        image *= 255
+        return image
+
+class DummyPreprocessor(object):
+    def __init__(self, height, width, batch, nclass):
+        self.height = height
+        self.width  = width
+        self.batch = batch
+        self.nclass = nclass
+
+class ImagePreprocessor(object):
+    def __init__(self, height, width, subset='train', dtype=tf.uint8):
+        self.height = height
+        self.width  = width
+        self.subset = subset
+        self.dtype = dtype
+        self.nsummary = 10 # Max no. images to generate summaries for
+    def preprocess(self, imgdata, bbox, thread_id):
+        with tf.name_scope('preprocess_image'):
+            try:
+                image = decode_jpeg(imgdata)
+            except:
+                image = decode_png(imgdata)
+            if thread_id < self.nsummary:
+                image_with_bbox = tf.image.draw_bounding_boxes(
+                    tf.expand_dims(tf.to_float(image), 0), bbox)
+                tf.summary.image('original_image_and_bbox', image_with_bbox)
+            image = random_crop_and_resize_image(image, bbox,
+                                                 self.height, self.width)
+            if thread_id < self.nsummary:
+                tf.summary.image('cropped_resized_image',
+                                 tf.expand_dims(image, 0))
+            if not FLAGS.eval:
+                image = tf.image.random_flip_left_right(image)
+            if thread_id < self.nsummary:
+                tf.summary.image('flipped_image',
+                                 tf.expand_dims(image, 0))
+            if FLAGS.distort_color and not FLAGS.eval:
+                image = distort_image_color(image, order=thread_id%2)
+                if thread_id < self.nsummary:
+                    tf.summary.image('distorted_color_image',
+                                     tf.expand_dims(image, 0))
+        return image
+    def minibatch(self, batch_size):
+        record_input = data_flow_ops.RecordInput(
+            file_pattern=os.path.join(FLAGS.data_dir, '%s-*' % self.subset),
+            parallelism=64,
+            seed=301+hvd.rank(),
+            # Note: This causes deadlock during init if larger than dataset
+            buffer_size=FLAGS.input_buffer_size,
+            batch_size=batch_size)
+        records = record_input.get_yield_op()
+        # Split batch into individual images
+        records = tf.split(records, batch_size, 0)
+        records = [tf.reshape(record, []) for record in records]
+        # Deserialize and preprocess images into batches for each device
+        images = []
+        labels = []
+        with tf.name_scope('input_pipeline'):
+            for i, record in enumerate(records):
+                imgdata, label, bbox, text = deserialize_image_record(record)
+                image = self.preprocess(imgdata, bbox, thread_id=i)
+                label -= 1 # Change to 0-based (don't use background class)
+                images.append(image)
+                labels.append(label)
+            # Stack images back into a single tensor
+            images = tf.parallel_stack(images)
+            labels = tf.concat(labels, 0)
+            images = tf.reshape(images, [-1, self.height, self.width, 3])
+            images = tf.clip_by_value(images, 0., 255.)
+            images = tf.cast(images, self.dtype)
+        return images, labels
+
+def stage(tensors):
+    """Stages the given tensors in a StagingArea for asynchronous put/get.
+    """
+    stage_area = data_flow_ops.StagingArea(
+        dtypes=[tensor.dtype       for tensor in tensors],
+        shapes=[tensor.get_shape() for tensor in tensors])
+    put_op      = stage_area.put(tensors)
+    get_tensors = stage_area.get()
+
+    get_tensors = [tf.reshape(gt, t.get_shape())
+                   for (gt,t) in zip(get_tensors, tensors)]
+    return put_op, get_tensors
 
 
+class FeedForwardTrainer(object):
+    def __init__(self, preprocessor, loss_func, nstep_per_epoch=None):
+        self.image_preprocessor = preprocessor
+        self.loss_func          = loss_func
+        with tf.device('/cpu:0'):
+            self.global_step = tf.get_variable(
+                'global_step', [],
+                initializer=tf.constant_initializer(0),
+                dtype=tf.int64,
+                trainable=False)
+        if FLAGS.lr_decay_policy == 'poly':
+            self.learning_rate = tf.train.polynomial_decay(
+                FLAGS.learning_rate,
+                self.global_step,
+                decay_steps=FLAGS.num_epochs*nstep_per_epoch,
+                end_learning_rate=0.,
+                power=FLAGS.lr_poly_power,
+                cycle=False)
+        else:
+            self.learning_rate = tf.train.exponential_decay(
+                FLAGS.learning_rate,
+                self.global_step,
+                decay_steps=FLAGS.lr_decay_epochs*nstep_per_epoch,
+                decay_rate=FLAGS.lr_decay_rate,
+                staircase=True)
+    def training_step(self, batch_size):
+        if type(self.image_preprocessor) is not DummyPreprocessor:
+            with tf.device('/cpu:0'):
+                images, labels = self.image_preprocessor.minibatch(batch_size)
+                # Stage images on the host
+                preload_op, (images, labels) = stage([images, labels])
+            with tf.device('/gpu:0'):
+                # Copy images from host to device
+                gpucopy_op, (images, labels) = stage([images, labels])
+        else:
+            with tf.device('/gpu:0'):
+                input_shape = [self.image_preprocessor.batch, 
+                               self.image_preprocessor.height,
+                               self.image_preprocessor.width,
+                               3]
+                images = tf.truncated_normal(
+                    input_shape,
+                    dtype=tf.float32,
+                    stddev=1.e-1,
+                    name='synthetic_images')
+                labels = tf.random_uniform(
+                    [self.image_preprocessor.batch],
+                    minval=0,
+                    maxval=self.image_preprocessor.nclass-1,
+                    dtype=tf.int32,
+                    name='synthetic_labels')
+                preload_op, (images, labels) = stage([images, labels])
+                gpucopy_op = None
 
-<!DOCTYPE html>
-<html lang="en-US" >
-
-<head>
-
-	
-	<script>
-window.ts_endpoint_url = "https:\/\/slack.com\/beacon\/timing";
-
-(function(e) {
-	var n=Date.now?Date.now():+new Date,r=e.performance||{},t=[],a={},i=function(e,n){for(var r=0,a=t.length,i=[];a>r;r++)t[r][e]==n&&i.push(t[r]);return i},o=function(e,n){for(var r,a=t.length;a--;)r=t[a],r.entryType!=e||void 0!==n&&r.name!=n||t.splice(a,1)};r.now||(r.now=r.webkitNow||r.mozNow||r.msNow||function(){return(Date.now?Date.now():+new Date)-n}),r.mark||(r.mark=r.webkitMark||function(e){var n={name:e,entryType:"mark",startTime:r.now(),duration:0};t.push(n),a[e]=n}),r.measure||(r.measure=r.webkitMeasure||function(e,n,r){n=a[n].startTime,r=a[r].startTime,t.push({name:e,entryType:"measure",startTime:n,duration:r-n})}),r.getEntriesByType||(r.getEntriesByType=r.webkitGetEntriesByType||function(e){return i("entryType",e)}),r.getEntriesByName||(r.getEntriesByName=r.webkitGetEntriesByName||function(e){return i("name",e)}),r.clearMarks||(r.clearMarks=r.webkitClearMarks||function(e){o("mark",e)}),r.clearMeasures||(r.clearMeasures=r.webkitClearMeasures||function(e){o("measure",e)}),e.performance=r,"function"==typeof define&&(define.amd||define.ajs)&&define("performance",[],function(){return r}) // eslint-disable-line
-})(window);
-
-</script>
-<script>
-
-
-;(function() {
-
-
-
-window.TSMark = function(mark_label) {
-	if (!window.performance || !window.performance.mark) return;
-	performance.mark(mark_label);
-};
-window.TSMark('start_load');
-
-
-window.TSMeasureAndBeacon = function(measure_label, start_mark_label) {
-	if (start_mark_label === 'start_nav' && window.performance && window.performance.timing) {
-		window.TSBeacon(measure_label, (new Date()).getTime() - performance.timing.navigationStart);
-		return;
-	}
-	if (!window.performance || !window.performance.mark || !window.performance.measure) return;
-	performance.mark(start_mark_label + '_end');
-	try {
-		performance.measure(measure_label, start_mark_label, start_mark_label + '_end');
-		window.TSBeacon(measure_label, performance.getEntriesByName(measure_label)[0].duration);
-	} catch (e) {
-		
-	}
-};
-
-
-if ('sendBeacon' in navigator) {
-	window.TSBeacon = function(label, value) {
-		var endpoint_url = window.ts_endpoint_url || 'https://slack.com/beacon/timing';
-		navigator.sendBeacon(endpoint_url + '?data=' + encodeURIComponent(label + ':' + value), '');
-	};
-} else {
-	window.TSBeacon = function(label, value) {
-		var endpoint_url = window.ts_endpoint_url || 'https://slack.com/beacon/timing';
-		(new Image()).src = endpoint_url + '?data=' + encodeURIComponent(label + ':' + value);
-	};
-}
-})();
-</script>
+        with tf.device('/gpu:0'):
+            # Evaluate the loss and compute the gradients
+            with tf.variable_scope(
+                    'GPU_0',
+                    # Force all variables to be stored as float32
+                    custom_getter=float32_variable_storage_getter) as var_scope:
+                loss, logits = self.loss_func(images, labels, var_scope)
  
+        with tf.device('/cpu:0'): # No in_top_k implem on GPU
+            top1 = tf.reduce_mean(
+                tf.cast(tf.nn.in_top_k(logits, labels, 1), tf.float32))
+            top5 = tf.reduce_mean(
+                tf.cast(tf.nn.in_top_k(logits, labels, 5), tf.float32))
 
-<script>
-window.TSMark('step_load');
-</script>	<noscript><meta http-equiv="refresh" content="0; URL=/?redir=%2Ffiles%2FU9HP5NQ68%2FF9V0TRG8H%2Fnvcnn_hvd.py&amp;nojsmode=1" /></noscript>
-<script type="text/javascript">
-if(self!==top)window.document.write("\u003Cstyle>body * {display:none !important;}\u003C\/style>\u003Ca href=\"#\" onclick="+
-"\"top.location.href=window.location.href\" style=\"display:block !important;padding:10px\">Go to Slack.com\u003C\/a>");
+            averager = tf.train.ExponentialMovingAverage(0.90, name='loss_avg',
+                                                         zero_debias=True)
+            avg_op = averager.apply([loss])
+            loss_avg = averager.average(loss)
+            # Note: This must be done _after_ the averager.average() call
+            #         because it changes total_loss into a new object.
+            with tf.control_dependencies([avg_op]):
+                total_loss     = tf.identity(loss)
+                total_loss_avg = tf.identity(loss_avg)
+            tf.summary.scalar('total loss raw', total_loss)
+            tf.summary.scalar('total loss avg', total_loss_avg)
+            tf.summary.scalar('train accuracy top-1 %', 100.*top1)
+            tf.summary.scalar('train accuracy top-5 %', 100.*top5)
+            tf.summary.scalar('learning rate', self.learning_rate)
 
-(function() {
-	var timer;
-	if (self !== top) {
-		timer = window.setInterval(function() {
-			if (window.$) {
-				try {
-					$('#page').remove();
-					$('#client-ui').remove();
-					window.TS = null;
-					window.clearInterval(timer);
-				} catch(e) {}
-			}
-		}, 200);
-	}
-}());
+        # Apply the gradients to optimize the loss function
+        with tf.device('/gpu:0'):
+            opt = tf.train.MomentumOptimizer(self.learning_rate, FLAGS.momentum,
+                                             use_nesterov=True)
+            opt = hvd.DistributedOptimizer(opt)
+            update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS) or []
+            with tf.control_dependencies(update_ops):
+                if FLAGS.loss_scale != 1:
+                    loss = loss * float(FLAGS.loss_scale)
+                gradvars = opt.compute_gradients(loss,
+                    gate_gradients=tf.train.Optimizer.GATE_NONE)
+                if FLAGS.loss_scale != 1:
+                    inv_scale = 1. / float(FLAGS.loss_scale)
+                    gradvars = [(grad * inv_scale, var)
+                                for grad, var in gradvars]
 
-</script>
+            if FLAGS.LARC_eta is not None:
+                LARC_eta = float(FLAGS.LARC_eta)
+                LARC_epsilon = float(FLAGS.LARC_epsilon)
+                v_list = [tf.norm(tensor=v, ord=2) for _, v in gradvars]
+                g_list = [tf.norm(tensor=g, ord=2) if g is not None else 0.0
+                          for g, _ in gradvars ]
+                v_norms = tf.stack(v_list)
+                g_norms = tf.stack(g_list)
+                zeds = tf.zeros_like(v_norms)
+                cond = tf.logical_and(
+                    tf.not_equal(v_norms, zeds),
+                    tf.not_equal(g_norms, zeds))
+                true_vals = tf.scalar_mul(LARC_eta, tf.div(v_norms, g_norms))
+                false_vals = tf.fill(tf.shape(v_norms), LARC_epsilon)
+                larc_local_lr = tf.where(cond, true_vals, false_vals)
+                if FLAGS.LARC_mode != "scale":
+                    ones = tf.ones_like(v_norms)
+                    lr = tf.fill(tf.shape(v_norms), self.learning_rate)
+                    larc_local_lr = tf.minimum(tf.div(larc_local_lr, lr), ones)
 
-<script>
+                gradvars = [(tf.multiply(larc_local_lr[i], g), v)
+                            if g is not None else (None, v) 
+                            for i, (g, v) in enumerate(gradvars) ]
 
-(function() {
+            train_op = opt.apply_gradients(gradvars)
 
+        with tf.device('/cpu:0'):
+            with tf.control_dependencies([train_op]):
+                increment_global_step_op = tf.assign_add(self.global_step, 1)
+        self.enqueue_ops = []
+        self.enqueue_ops.append(preload_op)
+        if gpucopy_op is not None:
+            self.enqueue_ops.append(gpucopy_op)
+        all_training_ops = (self.enqueue_ops + [increment_global_step_op])
+        return total_loss_avg, self.learning_rate, all_training_ops
+    def init(self, sess):
+        init_op = tf.global_variables_initializer()
+        sess.run(init_op)
+    def sync(self, sess):
+        sync_op = hvd.broadcast_global_variables(0)
+        sess.run(sync_op)
+    def prefill_pipeline(self, sess):
+        # Pre-fill the input pipeline with data
+        for i in range(len(self.enqueue_ops)):
+            sess.run(self.enqueue_ops[:i+1])
 
-	window.callSlackAPIUnauthed = function(method, args, callback) {
-		var timestamp = Date.now() / 1000;  
-		var version = (window.TS && TS.boot_data && TS.boot_data.version_uid) ? TS.boot_data.version_uid.substring(0, 8) : 'noversion';
-		var url = '/api/' + method + '?_x_id=' + version + '-' + timestamp;
+class FeedForwardEvaluator(object):
+    def __init__(self, preprocessor, eval_func):
+        self.eval_func          = eval_func
+        self.image_preprocessor = preprocessor
+    def evaluation_step(self, batch_size):
+        with tf.device('/cpu:0'):
+            images, labels = self.image_preprocessor.minibatch(batch_size)
+            # Stage images on the host
+            preload_op, (images, labels) = stage([images, labels])
+        with tf.device('/gpu:0'):
+            # Copy images from host to device
+            gpucopy_op, (images, labels) = stage([images, labels])
+            # Evaluate the loss and compute the gradients
+            with tf.variable_scope('GPU_0') as var_scope:
+                top1, top5 = self.eval_func(images, labels, var_scope)
+        self.enqueue_ops = [preload_op, gpucopy_op]
+        return top1, top5, self.enqueue_ops
+    def prefill_pipeline(self, sess):
+        # Pre-fill the input pipeline with data
+        for i in range(len(self.enqueue_ops)):
+            sess.run(self.enqueue_ops[:i+1])
 
-		var req = new XMLHttpRequest();
+def inference_trivial(net, input_layer):
+    """A trivial model for benchmarking input pipeline performance"""
+    net.use_batch_norm = False
+    x = net.input_layer(input_layer)
+    x = net.flatten(x)
+    x = net.fully_connected(x, 1)
+    return x
 
-		req.onreadystatechange = function() {
-			if (req.readyState == 4) {
-				req.onreadystatechange = null;
-				var obj;
+def inference_lenet5(net, input_layer):
+    """Tiny network matching TF's MNIST tutorial model"""
+    net.use_batch_norm = False
+    x = net.input_layer(input_layer)
+    x = net.conv(x, 32,    (5,5))
+    x = net.pool(x, 'MAX', (2,2))
+    x = net.conv(x, 64,    (5,5))
+    x = net.pool(x, 'MAX', (2,2))
+    x = net.flatten(x)
+    x = net.fully_connected(x, 512)
+    return x
 
-				if (req.status == 200 || req.status == 429) {
-					try {
-						obj = JSON.parse(req.responseText);
-					} catch (err) {
-						TS.warn(8675309, 'unable to do anything with api rsp');
-					}
-				}
+def inference_overfeat(net, input_layer):
+    net.use_batch_norm = False
+    x = net.input_layer(input_layer)
+    x = net.conv(x, 96,   (11,11), (4,4), 'VALID')
+    x = net.pool(x, 'MAX', (2,2))
+    x = net.conv(x, 256,   (5,5), (1,1), 'VALID')
+    x = net.pool(x, 'MAX', (2,2))
+    x = net.conv(x, 512,   (3,3))
+    x = net.conv(x, 1024,  (3,3))
+    x = net.conv(x, 1024,  (3,3))
+    x = net.pool(x, 'MAX', (2,2))
+    x = net.flatten(x)
+    x = net.fully_connected(x, 3072)
+    x = net.fully_connected(x, 4096)
+    return x
 
-				obj = obj || {
-					ok: false,
-				};
+def inference_alexnet_owt(net, input_layer):
+    """Alexnet One Weird Trick model
+    https://arxiv.org/abs/1404.5997
+    """
+    net.use_batch_norm = False
+    x = net.input_layer(input_layer)
+    # Note: VALID requires padding the images by 3 in width and height
+    x = net.conv(x, 64, (11,11), (4,4), 'VALID')
+    x = net.pool(x, 'MAX', (3,3))
+    x = net.conv(x, 192,   (5,5))
+    x = net.pool(x, 'MAX', (3,3))
+    x = net.conv(x, 384,   (3,3))
+    x = net.conv(x, 256,   (3,3))
+    x = net.conv(x, 256,   (3,3))
+    x = net.pool(x, 'MAX', (3,3))
+    x = net.flatten(x)
+    x = net.fully_connected(x, 4096)
+    x = net.dropout(x)
+    x = net.fully_connected(x, 4096)
+    x = net.dropout(x)
+    return x
 
-				callback(obj.ok, obj, args);
-			}
-		};
+def inference_vgg_impl(net, input_layer, layer_counts):
+    net.use_batch_norm = False
+    x = net.input_layer(input_layer)
+    for _ in range(layer_counts[0]): x = net.conv(x,  64, (3,3))
+    x = net.pool(x, 'MAX', (2,2))
+    for _ in range(layer_counts[1]): x = net.conv(x, 128, (3,3))
+    x = net.pool(x, 'MAX', (2,2))
+    for _ in range(layer_counts[2]): x = net.conv(x, 256, (3,3))
+    x = net.pool(x, 'MAX', (2,2))
+    for _ in range(layer_counts[3]): x = net.conv(x, 512, (3,3))
+    x = net.pool(x, 'MAX', (2,2))
+    for _ in range(layer_counts[4]): x = net.conv(x, 512, (3,3))
+    x = net.pool(x, 'MAX', (2,2))
+    x = net.flatten(x)
+    x = net.fully_connected(x, 4096)
+    x = net.fully_connected(x, 4096)
+    return x
+def inference_vgg(net, input_layer, nlayer):
+    """Visual Geometry Group's family of models
+    https://arxiv.org/abs/1409.1556
+    """
+    if   nlayer == 11: return inference_vgg_impl(net, input_layer, [1,1,2,2,2]) # A
+    elif nlayer == 13: return inference_vgg_impl(net, input_layer, [2,2,2,2,2]) # B
+    elif nlayer == 16: return inference_vgg_impl(net, input_layer, [2,2,3,3,3]) # D
+    elif nlayer == 19: return inference_vgg_impl(net, input_layer, [2,2,4,4,4]) # E
+    else: raise ValueError("Invalid nlayer (%i); must be one of: 11,13,16,19" %
+                           nlayer)
 
-		var async = true;
-		req.open('POST', url, async);
+def inference_googlenet(net, input_layer):
+    """GoogLeNet model
+    https://arxiv.org/abs/1409.4842
+    """
+    net.use_batch_norm = False
+    def inception_v1(net, x, k, l, m, n, p, q):
+        cols = [[('conv', k, (1,1))],
+                [('conv', l, (1,1)), ('conv', m, (3,3))],
+                [('conv', n, (1,1)), ('conv', p, (5,5))],
+                [('pool', 'MAX', (3,3), (1,1), 'SAME'), ('conv', q, (1,1))]]
+        return net.inception_module(x, 'incept_v1', cols)
+    x = net.input_layer(input_layer)
+    x = net.conv(x,    64, (7,7), (2,2))
+    x = net.pool(x, 'MAX', (3,3), padding='SAME')
+    x = net.conv(x,    64, (1,1))
+    x = net.conv(x,   192, (3,3))
+    x = net.pool(x, 'MAX', (3,3), padding='SAME')
+    x = inception_v1(net, x,  64,  96, 128, 16,  32,  32)
+    x = inception_v1(net, x, 128, 128, 192, 32,  96,  64)
+    x = net.pool(x, 'MAX', (3,3), padding='SAME')
+    x = inception_v1(net, x, 192,  96, 208, 16,  48,  64)
+    x = inception_v1(net, x, 160, 112, 224, 24,  64,  64)
+    x = inception_v1(net, x, 128, 128, 256, 24,  64,  64)
+    x = inception_v1(net, x, 112, 144, 288, 32,  64,  64)
+    x = inception_v1(net, x, 256, 160, 320, 32, 128, 128)
+    x = net.pool(x, 'MAX', (3,3), padding='SAME')
+    x = inception_v1(net, x, 256, 160, 320, 32, 128, 128)
+    x = inception_v1(net, x, 384, 192, 384, 48, 128, 128)
+    x = net.spatial_avg(x)
+    return x
 
-		var form_data = new FormData();
-		var has_data = false;
-		Object.keys(args).forEach(function(k) {
-			if (k[0] === '_') return;
-			form_data.append(k, args[k]);
-			has_data = true;
-		});
+def inference_inception_v3(net, input_layer):
+    """Google's Inception v3 model
+    https://arxiv.org/abs/1512.00567
+    """
+    def inception_v3_a(net, x, n):
+        cols = [[('conv',  64, (1,1))],
+                [('conv',  48, (1,1)), ('conv',  64, (5,5))],
+                [('conv',  64, (1,1)), ('conv',  96, (3,3)), ('conv',  96, (3,3))],
+                [('pool', 'AVG', (3,3), (1,1), 'SAME'), ('conv',   n, (1,1))]]
+        return net.inception_module(x, 'incept_v3_a', cols)
+    def inception_v3_b(net, x):
+        cols = [[('conv',  64, (1,1)), ('conv',  96, (3,3)), ('conv',  96, (3,3), (2,2), 'VALID')],
+                [('conv', 384, (3,3), (2,2), 'VALID')],
+                [('pool', 'MAX', (3,3), (2,2), 'VALID')]]
+        return net.inception_module(x, 'incept_v3_b', cols)
+    def inception_v3_c(net, x, n):
+        cols = [[('conv', 192, (1,1))],
+                [('conv',   n, (1,1)), ('conv',   n, (1,7)), ('conv', 192, (7,1))],
+                [('conv',   n, (1,1)), ('conv',   n, (7,1)), ('conv',   n, (1,7)), ('conv',   n, (7,1)), ('conv', 192, (1,7))],
+                [('pool', 'AVG', (3,3), (1,1), 'SAME'), ('conv', 192, (1,1))]]
+        return net.inception_module(x, 'incept_v3_c', cols)
+    def inception_v3_d(net, x):
+        cols = [[('conv', 192, (1,1)), ('conv', 320, (3,3), (2,2), 'VALID')],
+                [('conv', 192, (1,1)), ('conv', 192, (1,7)), ('conv', 192, (7,1)), ('conv', 192, (3,3), (2,2), 'VALID')],
+                [('pool', 'MAX', (3,3), (2,2), 'VALID')]]
+        return net.inception_module(x, 'incept_v3_d',cols)
+    def inception_v3_e(net, x, pooltype):
+        cols = [[('conv', 320, (1,1))],
+                [('conv', 384, (1,1)), ('conv', 384, (1,3))],
+                [('share',),           ('conv', 384, (3,1))],
+                [('conv', 448, (1,1)), ('conv', 384, (3,3)), ('conv', 384, (1,3))],
+                [('share',),          ('share',),            ('conv', 384, (3,1))],
+                [('pool', pooltype, (3,3), (1,1), 'SAME'),   ('conv', 192, (1,1))]]
+        return net.inception_module(x, 'incept_v3_e', cols)
 
-		if (has_data) {
-			req.send(form_data);
-		} else {
-			req.send();
-		}
-	};
-})();
-</script>
+    # TODO: This does not include the extra 'arm' that forks off
+    #         from before the 3rd-last module (the arm is designed
+    #         to speed up training in the early stages).
+    net.use_batch_norm = True
+    x = net.input_layer(input_layer)
+    x = net.conv(x,    32, (3,3), (2,2), padding='VALID')
+    x = net.conv(x,    32, (3,3), (1,1), padding='VALID')
+    x = net.conv(x,    64, (3,3), (1,1), padding='SAME')
+    x = net.pool(x, 'MAX', (3,3))
+    x = net.conv(x,    80, (1,1), (1,1), padding='VALID')
+    x = net.conv(x,   192, (3,3), (1,1), padding='VALID')
+    x = net.pool(x, 'MAX', (3,3))
+    x = inception_v3_a(net, x, 32)
+    x = inception_v3_a(net, x, 64)
+    x = inception_v3_a(net, x, 64)
+    x = inception_v3_b(net, x)
+    x = inception_v3_c(net, x, 128)
+    x = inception_v3_c(net, x, 160)
+    x = inception_v3_c(net, x, 160)
+    x = inception_v3_c(net, x, 192)
+    x = inception_v3_d(net, x)
+    x = inception_v3_e(net, x, 'AVG')
+    x = inception_v3_e(net, x, 'MAX')
+    x = net.spatial_avg(x)
+    return x
 
-	<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/webpack.manifest.d9a2676e14e30bd41692.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
+def resnet_bottleneck_v1(net, input_layer, depth, depth_bottleneck, stride,
+                         basic=False):
+    num_inputs = input_layer.get_shape().as_list()[1]
+    x = input_layer
+    s = stride
+    with tf.name_scope('resnet_v1'):
+        if depth == num_inputs:
+            if stride == 1:
+                shortcut = input_layer
+            else:
+                shortcut = net.pool(x, 'MAX', (1,1), (s,s))
+        else:
+            shortcut = net.conv(x, depth, (1,1), (s,s), activation='LINEAR')
+        if basic:
+            x = net.conv(x, depth_bottleneck, (3,3), (s,s), padding='SAME_RESNET')
+            x = net.conv(x, depth,            (3,3), activation='LINEAR')
+        else:
+            x = net.conv(x, depth_bottleneck, (1,1), (s,s))
+            x = net.conv(x, depth_bottleneck, (3,3), padding='SAME')
+            x = net.conv(x, depth,            (1,1), activation='LINEAR')
+        x = net.activate(x + shortcut)
+        return x
+    
+def resnext_split_branch(net, input_layer, stride):
+    x = input_layer
+    with tf.name_scope('resnext_split_branch'):
+        x = net.conv(x, net.bottleneck_width, (1, 1), (stride, stride), activation='RELU', use_batch_norm=True)
+        x = net.conv(x, net.bottleneck_width, (3, 3), (1, 1), activation='RELU', use_batch_norm=True)
+    return x
 
-			
-	
-		<script>
-			if (window.location.host == 'slack.com' && window.location.search.indexOf('story') < 0) {
-				document.cookie = '__cvo_skip_doc=' + escape(document.URL) + '|' + escape(document.referrer) + ';path=/';
-			}
-		</script>
-	
+def resnext_shortcut(net, input_layer, stride, input_size, output_size):
+    x = input_layer
+    useConv = net.shortcut_type == 'C' or (net.shortcut_type == 'B' and input_size != output_size)
+    with tf.name_scope('resnext_shortcut'):
+        if useConv:
+            x = net.conv(x, output_size, (1,1), (stride, stride), use_batch_norm=True)
+        elif output_size == input_size:
+            if stride == 1:
+                x = input_layer
+            else:
+                x = net.pool(x, 'MAX', (1,1), (stride, stride))
+        else:
+            x = input_layer
+    return x
 
-		<script type="text/javascript">
-		
-		try {
-			if(window.location.hash && !window.location.hash.match(/^(#?[a-zA-Z0-9_]*)$/)) {
-				window.location.hash = '';
-			}
-		} catch(e) {}
-		
-	</script>
+def resnext_bottleneck_v1(net, input_layer, depth, depth_bottleneck, stride):
+    num_inputs = input_layer.get_shape().as_list()[1]
+    x = input_layer
+    with tf.name_scope('resnext_bottleneck_v1'):
+        shortcut = resnext_shortcut(net, x, stride, num_inputs, depth)
+        branches_list = []
+        for i in range(net.cardinality):
+            branch = resnext_split_branch(net, x, stride)
+            branches_list.append(branch)
+        concatenated_branches = tf.concat(values=branches_list, axis=1, name='concat')
+        bottleneck_depth = concatenated_branches.get_shape().as_list()[1]
+        x = net.conv(concatenated_branches, depth, (1, 1), (1, 1), activation=None)
+        x = net.activate(x + shortcut, 'RELU')
+    return x
 
-	<script type="text/javascript">
-				
-			window.optimizely = [];
-			window.dataLayer = [];
-			window.ga = false;
-		
-	
-				(function(e,c,b,f,d,g,a){e.SlackBeaconObject=d;
-		e[d]=e[d]||function(){(e[d].q=e[d].q||[]).push([1*new Date(),arguments])};
-		e[d].l=1*new Date();g=c.createElement(b);a=c.getElementsByTagName(b)[0];
-		g.async=1;g.src=f;a.parentNode.insertBefore(g,a)
-		})(window,document,"script","https://a.slack-edge.com/bv1-1/slack_beacon.5dbbc3dd9f37d8bc2f4e.min.js","sb");
-		sb('set', 'token', '3307f436963e02d4f9eb85ce5159744c');
+def inference_residual(net, input_layer, layer_counts, bottleneck_callback):
+    net.use_batch_norm = True
+    x = net.input_layer(input_layer)
+    x = net.conv(x, 64,    (7,7), (2,2), padding='SAME_RESNET')
+    x = net.pool(x, 'MAX', (3,3), (2,2), padding='SAME')
+    for i in range(layer_counts[0]):
+        x = bottleneck_callback(net, x,  256,  64, 1)
+    for i in range(layer_counts[1]):
+        x = bottleneck_callback(net, x, 512, 128, 2 if i==0 else 1)
+    for i in range(layer_counts[2]):
+        x = bottleneck_callback(net, x, 1024, 256, 2 if i==0 else 1)
+    for i in range(layer_counts[3]):
+        x = bottleneck_callback(net, x, 2048, 512, 2 if i==0 else 1)
+    x = net.spatial_avg(x)
+    return x
 
-				sb('track', 'pageview');
+def inference_resnet_v1_basic_impl(net, input_layer, layer_counts):
+    basic_resnet_bottleneck_callback = partial(resnet_bottleneck_v1, basic=True)
+    return inference_residual(net, input_layer, layer_counts, basic_resnet_bottleneck_callback)
 
-		
-		function track(a) {
-			if(window.ga) ga('send','event','web', a);
-			if(window.sb) sb('track', a);
-		}
-		
+def inference_resnet_v1_impl(net, input_layer, layer_counts):
+    return inference_residual(net, input_layer, layer_counts, resnet_bottleneck_v1)
 
-	</script>
+def inference_resnext_v1_impl(net, input_layer, layer_counts):
+    return inference_residual(net, input_layer, layer_counts, resnext_bottleneck_v1)
 
-	
-
-	<meta name="referrer" content="no-referrer">
-		<meta name="superfish" content="nofish">
-
-	<script type="text/javascript">
-
-
-
-var TS_last_log_date = null;
-var TSMakeLogDate = function() {
-	var date = new Date();
-
-	var y = date.getFullYear();
-	var mo = date.getMonth()+1;
-	var d = date.getDate();
-
-	var time = {
-	  h: date.getHours(),
-	  mi: date.getMinutes(),
-	  s: date.getSeconds(),
-	  ms: date.getMilliseconds()
-	};
-
-	Object.keys(time).map(function(moment, index) {
-		if (moment == 'ms') {
-			if (time[moment] < 10) {
-				time[moment] = time[moment]+'00';
-			} else if (time[moment] < 100) {
-				time[moment] = time[moment]+'0';
-			}
-		} else if (time[moment] < 10) {
-			time[moment] = '0' + time[moment];
-		}
-	});
-
-	var str = y + '/' + mo + '/' + d + ' ' + time.h + ':' + time.mi + ':' + time.s + '.' + time.ms;
-	if (TS_last_log_date) {
-		var diff = date-TS_last_log_date;
-		//str+= ' ('+diff+'ms)';
-	}
-	TS_last_log_date = date;
-	return str+' ';
-}
-
-var parseDeepLinkRequest = function(code) {
-	var m = code.match(/"id":"([CDG][A-Z0-9]{8})"/);
-	var id = m ? m[1] : null;
-
-	m = code.match(/"team":"(T[A-Z0-9]{8})"/);
-	var team = m ? m[1] : null;
-
-	m = code.match(/"message":"([0-9]+\.[0-9]+)"/);
-	var message = m ? m[1] : null;
-
-	return { id: id, team: team, message: message };
-}
-
-if ('rendererEvalAsync' in window) {
-	var origRendererEvalAsync = window.rendererEvalAsync;
-	window.rendererEvalAsync = function(blob) {
-		try {
-			var data = JSON.parse(decodeURIComponent(atob(blob)));
-			if (data.code.match(/handleDeepLink/)) {
-				var request = parseDeepLinkRequest(data.code);
-				if (!request.id || !request.team || !request.message) return;
-
-				request.cmd = 'channel';
-				TSSSB.handleDeepLinkWithArgs(JSON.stringify(request));
-				return;
-			} else {
-				origRendererEvalAsync(blob);
-			}
-		} catch (e) {
-		}
-	}
-}
-</script>
-
-
-
-<script type="text/javascript">
-
-	var TSSSB = {
-		call: function() {
-			return false;
-		}
-	};
-
-</script>
-<script>TSSSB.env = (function() {
-
-
-	var v = {
-		win_ssb_version: null,
-		win_ssb_version_minor: null,
-		mac_ssb_version: null,
-		mac_ssb_version_minor: null,
-		mac_ssb_build: null,
-		lin_ssb_version: null,
-		lin_ssb_version_minor: null,
-		desktop_app_version: null,
-	};
-
-	var is_win = (navigator.appVersion.indexOf('Windows') !== -1);
-	var is_lin = (navigator.appVersion.indexOf('Linux') !== -1);
-	var is_mac = !!(navigator.userAgent.match(/(OS X)/g));
-
-	if (navigator.userAgent.match(/(Slack_SSB)/g) || navigator.userAgent.match(/(Slack_WINSSB)/g)) {
-		
-		var parts = navigator.userAgent.split('/');
-		var version_str = parts[parts.length - 1];
-		var version_float = parseFloat(version_str);
-		var version_parts = version_str.split('.');
-		var version_minor = (version_parts.length == 3) ? parseInt(version_parts[2], 10) : 0;
-
-		if (navigator.userAgent.match(/(AtomShell)/g)) {
-			
-			if (is_lin) {
-				v.lin_ssb_version = version_float;
-				v.lin_ssb_version_minor = version_minor;
-			} else if (is_win) {
-				v.win_ssb_version = version_float;
-				v.win_ssb_version_minor = version_minor;
-			} else if (is_mac) {
-				v.mac_ssb_version = version_float;
-				v.mac_ssb_version_minor = version_minor;
-			}
-
-			if (version_parts.length >= 3) {
-				v.desktop_app_version = {
-					major: parseInt(version_parts[0], 10),
-					minor: parseInt(version_parts[1], 10),
-					patch: parseInt(version_parts[2], 10),
-				};
-			}
-		}
-	}
-
-	return v;
-})();
-</script>
-
-
-	<script type="text/javascript">
-		
-		window.addEventListener('load', function() {
-			var was_TS = window.TS;
-			delete window.TS;
-			if (was_TS) window.TS = was_TS;
-		});
-	</script>
-	        <title>Slack</title>
-    <meta name="author" content="Slack">
+def inference_resnet_v1(net, input_layer, nlayer):
+    """Deep Residual Networks family of models
+    https://arxiv.org/abs/1512.03385
+    """
+    if   nlayer ==  18: return inference_resnet_v1_basic_impl(net, input_layer, [2,2, 2,2])
+    elif nlayer ==  34: return inference_resnet_v1_basic_impl(net, input_layer, [3,4, 6,3])
+    elif nlayer ==  50: return inference_resnet_v1_impl(net, input_layer, [3,4, 6,3])
+    elif nlayer == 101: return inference_resnet_v1_impl(net, input_layer, [3,4,23,3])
+    elif nlayer == 152: return inference_resnet_v1_impl(net, input_layer, [3,8,36,3])
+    else: raise ValueError("Invalid nlayer (%i); must be one of: 18,34,50,101,152" %
+                           nlayer)
         
-    <meta name="robots" content="noindex,nofollow">
-
-	
-		
-	
-	
-		
-					
-	
-						
-	
-	
-
-																
-	
-	
-	
-	
-	
-	
-		<!-- output_css "sk_adapter" -->
-    <link href="https://a.slack-edge.com/7057c/style/rollup-slack_kit_legacy_adapters.css" rel="stylesheet" type="text/css" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)">
-
-			<!-- output_css "core" -->
-    <link href="https://a.slack-edge.com/005d9/style/rollup-plastic.css" rel="stylesheet" type="text/css" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)">
-
-		<!-- output_css "before_file_pages" -->
-
-	<!-- output_css "file_pages" -->
-
-	
-			<!-- output_css "slack_kit_helpers" -->
-    <link href="https://a.slack-edge.com/58329/style/rollup-slack_kit_helpers.css" rel="stylesheet" type="text/css" id="slack_kit_helpers_stylesheet"  crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)">
-
-	<!-- output_css "regular" -->
-    <link href="https://a.slack-edge.com/e433/style/signin.css" rel="stylesheet" type="text/css" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)">
-    <link href="https://a.slack-edge.com/698de/style/index.css" rel="stylesheet" type="text/css" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)">
-    <link href="https://a.slack-edge.com/5e83b/style/libs/lato-2-compressed.css" rel="stylesheet" type="text/css" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)">
-    <link href="https://a.slack-edge.com/c4512/style/sticky_nav.css" rel="stylesheet" type="text/css" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)">
-    <link href="https://a.slack-edge.com/176a/style/footer.css" rel="stylesheet" type="text/css" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)">
-
-	
-
-	
-	
-		<meta name="robots" content="noindex, nofollow" />
-	
-
-	
-<link id="favicon" rel="shortcut icon" href="https://a.slack-edge.com/436da/marketing/img/meta/favicon-32.png" sizes="16x16 32x32 48x48" type="image/png" />
-
-<link rel="icon" href="https://a.slack-edge.com/436da/marketing/img/meta/app-256.png" sizes="256x256" type="image/png" />
-
-<link rel="apple-touch-icon-precomposed" sizes="152x152" href="https://a.slack-edge.com/436da/marketing/img/meta/ios-152.png" />
-<link rel="apple-touch-icon-precomposed" sizes="144x144" href="https://a.slack-edge.com/436da/marketing/img/meta/ios-144.png" />
-<link rel="apple-touch-icon-precomposed" sizes="120x120" href="https://a.slack-edge.com/436da/marketing/img/meta/ios-120.png" />
-<link rel="apple-touch-icon-precomposed" sizes="114x114" href="https://a.slack-edge.com/436da/marketing/img/meta/ios-114.png" />
-<link rel="apple-touch-icon-precomposed" sizes="72x72" href="https://a.slack-edge.com/436da/marketing/img/meta/ios-72.png" />
-<link rel="apple-touch-icon-precomposed" href="https://a.slack-edge.com/436da/marketing/img/meta/ios-57.png" />
-
-<meta name="msapplication-TileColor" content="#FFFFFF" />
-<meta name="msapplication-TileImage" content="https://a.slack-edge.com/436da/marketing/img/meta/app-144.png" />
-	
-</head>
-
-<body class="	index			deprecated">
-
-		  			<script>
-		
-			var w = Math.max(document.documentElement.clientWidth, window.innerWidth || 0);
-			if (w > 1440) document.querySelector('body').classList.add('widescreen');
-		
-		</script>
-	
-  	
-	
-	
-
-	
-					
-
-	
-
-
-
-	<nav class="top persistent">
-	
-		
-		<a href="https://slack.com/" class="logo" data-qa="logo" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=logo" aria-label="Slack homepage"></a>
-	
-		
-							
-					<ul>
-				<li><a  href="https://slack.com/is" data-qa="product" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_product">Product</a></li>
-				<li><a  href="https://slack.com/pricing?ui_step=55&ui_element=5" data-qa="pricing" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_pricing">Pricing</a></li>				<li><a  href="https://get.slack.help/hc/en-us" data-qa="support" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_support">Support</a></li>
-
-								<li class= "mobile_btn download_slack"><a  href="/get" data-qa="download_slack" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_download">Download Slack</a></li>									<li><a data-gtm-click="SignUp,optout_nav_create_team" href="https://slack.com/create" class="" data-qa="create_team" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_create_team">Create a new workspace</a></li>
-					<li><a  href="https://slack.com/get-started" data-gtm-click="optout_nav_find_team" data-qa="find_team" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_find_team">Find your workspace</a></li>
-
-					<li class="sign_in hide_on_mobile"><a data-gtm-click="optout_nav_signin" href="https://slack.com/signin" class="btn_sticky btn_filled" data-qa="sign_in" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_sign_in">Sign in</a></li>
-								<li class="mobile_btn mobile_menu_btn">
-					<a href="#" class="btn_sticky" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_mobile_menu_btn">Menu</a>
-				</li>
-			</ul>
-
-			
-			</nav>
-
-
-
-<nav class="mobile_menu loading menu_scroll" aria-hidden="true">
-	<div class="mobile_menu_wrapper">
-	<div class="mobile_menu_header">
-			<a href="https://slack.com/" class="logo" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_logo"></a>
-			<a href="#" class="close" aria-label="close" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_menu_close"><ts-icon class="ts_icon ts_icon_times"></ts-icon></a>
-	</div>
-					<ul>
-				<li><a  href="https://slack.com/is" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_product">Product</a></li>
-				<li><a  href="https://slack.com/pricing?ui_step=55&ui_element=5" class="mobile_nav_pricing" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_pricing">Pricing</a></li>				<li><a  href="https://get.slack.help/hc/en-us" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_support">Support</a></li>
-				<li><a  href="/get" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_download">Download <span class="optional_desktop_nav_message">the Slack app</span></a></li>
-			</ul>
-
-			<ul class="mobile_menu_footer">
-				
-				<li><a href="https://slack.com/signin" data-gtm-click="optout_nav_signin" target="_blank" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_sign_in"><ts-icon class="ts_icon small float_none team_icon ts_icon_plus default signup_icon"></ts-icon> <span class="switcher_label">Sign in</span></a></li>
-
-				<li><a data-gtm-click="SignUp,optout_nav_create_team" href="https://slack.com/create" class="" target="_blank" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=nav_create_team"><ts-icon class="ts_icon small float_none team_icon ts_icon_slack_pillow default signup_icon"></ts-icon> <span class="switcher_label">Create a new workspace</span></a></li>			</ul>
-			</div>
-</nav>
-
-	
-	<div id="page" >
-
-		<div id="page_contents" data-qa="page_contents" class="">
-
-<div class="span_4_of_6 col float_none margin_auto no_right_padding">
-	
-		<p class="alert alert_info"><i class="ts_icon ts_icon_info_circle"></i> You need to sign in to see this page.</p>
-
-	
-<p id="error_ratelimit" class="alert alert_warning" style="display: none;">
-	<i class="ts_icon ts_icon_warning"></i>
-	
-	<strong>Too many login failures!</strong><br class="hide_on_mobile" />
-	Apologies! There were too many SMS message requests in a short period, so you’ll have to wait a moment to try again.
-	</p>
-<p id="error_unknown" class="alert alert_error" style="display: none;">
-	<i class="ts_icon ts_icon_warning"></i> Hmmm... something went wrong. Please try again.</p></div>
-
-	
-<div class="real_content card align_center span_4_of_6 col float_none margin_auto large_bottom_margin right_padding large_bottom_padding">
-	<h1 id="signin_header" class="tiny_bottom_margin"> 
-	Sign in to <span class="break_word">TF-AWS-NV</span>
-	</h1>
-
-	<p class="medium_bottom_margin">tf-aws-nv.slack.com</p>
-
-	
-	<div class="col span_4_of_6 float_none margin_auto signin_card">
-		<form id="signin_form" action="/" method="post" accept-encoding="UTF-8">
-			<input type="hidden" name="signin" value="1">
-			<input type="hidden" name="redir" value="/files/U9HP5NQ68/F9V0TRG8H/nvcnn_hvd.py">
-						<input type="hidden" name="crumb" value="s-1521916250-0aad5f2323959a9184ce3d08450d4c6194a0315da515f055240a88fc6940ae8c-☃" />
-
-			<p class="browser_password align_left">Enter your <strong>email address</strong> and <strong>password</strong>.</p>
-			<p class="ssb_password hidden">What is your <strong>password</strong>?</p>
-
-			<p class=" no_bottom_margin">
-				<input type="email" id="email" name="email" size="40" value="" placeholder="you@example.com">
-			</p>
-
-			<p class=" small_bottom_margin">
-				<input type="password" id="password" name="password" size="40" placeholder="password" >
-			</p>
-
-			
-						
-
-			<p><button id="signin_btn" type="submit" class="btn btn_large full_width ladda-button" data-style="expand-right"><span class="ladda-label">Sign in</span></button></p>
-
-			<div class="align_left">
-				<label class="checkbox normal inline_block small_right_margin"><input type="checkbox" name="remember" checked> Remember me</label>
-			</div>
-	
-			<div class="align_left small_top_margin">
-				<a id="forgot-pw" href="/forgot">Forgot password?</a>
-									· <a href="https://slack.com/get-started">Forgot which email you used?</a>
-							</div>
-
-		</form>
-		<div id="magic_login_cta" class="float_none margin_auto hidden">
-
-   		<div class="or no_wrap small_top_padding medium_bottom_margin align_center">or</div>
-
-			 <p class="large_bottom_margin"><strong>Long password? Hard to type?</strong><br /> We can email you a magic link so you can sign in without having to type your password.</p>
-
-			<form id="magic_login" action="/" method="post" accept-encoding="UTF-8" class="align_center float_none margin_auto medium_bottom_margin">
-				<input type="hidden" name="crumb" value="s-1521916250-0aad5f2323959a9184ce3d08450d4c6194a0315da515f055240a88fc6940ae8c-☃" />
-				<input type="hidden" name="email">
-				<input type="hidden" name="signin_request_magiclogin" value="1">
-				<button class="btn btn_large btn_outline full_width"><ts-icon class="ts_icon_magic"></ts-icon>Email Me A Link</button>
-			</form>	
-
-		</div>
-
-
-	</div>
-
-	<p class="small clear_both taller_line_height">
-			</p>
-</div>
-	
-<div class="real_content align_center">
-			<p>
-			<span class="bold">Don't have an account on this workspace yet?</span>
-			<span class="clear_both block">Contact the workspace administrator for an invitation</span>
-		</p>
-	
-	
-			<p>
-			Trying to create a workspace?			
-	
-	<a data-gtm-click="SignUp" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=inc_download_app_or_sign_in_cta_sign_up_link" href="/create" class="bold">Create a new workspace</a>
-			</p>
-	</div>
-
-					
-	</div>
-	<div id="overlay"></div>
-</div>
-
-
-	
-
-
-<footer  data-qa="footer">
-	<section class="links">
-		<div class="grid">
-			<div class="col span_1_of_4 nav_col">
-				<ul>
-					<li class="cat_1">Using Slack</li>
-					<li><a href="/is" data-qa="product_footer" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_product">Product</a></li>
-					<li><a href="/enterprise" data-qa="enterprise_footer" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_enterprise">Enterprise</a></li>
-					<li><a href="/pricing?ui_step=28&ui_element=5" data-qa="pricing_footer" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_pricing">Pricing</a></li>
-					<li><a href="https://get.slack.help/hc/en-us" data-qa="support_footer" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_support">Support</a></li>
-					<li><a href="/guides" data-qa="getting_started" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_getting_started">Slack Guides</a></li>
-					<li><a href="/apps" data-qa="app_directory" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_app_directory">App Directory</a></li>
-					<li><a href="https://api.slack.com/" data-qa="api" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_api">API</a></li>
-				</ul>
-			</div>
-			<div class="col span_1_of_4 nav_col">
-				<ul>
-					<li class="cat_2">Slack <ts-icon class="ts_icon_heart"></ts-icon></li>
-					<li><a href="/jobs" data-qa="jobs" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_jobs">Jobs</a></li>
-					<li><a href="/customers" data-qa="customers" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_customers">Customers</a></li>
-					<li><a href="/developers" data-qa="developers" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_developers">Developers</a></li>
-					<li><a href="/events" data-qa="events" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_events">Events</a></li>
-					<li><a href="https://slackhq.com/" data-qa="blog_footer" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_blog">Blog</a></li>
-					<li><a href="/podcast" data-qa="podcast" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_podcast">Podcast</a></li>
-					<li><a href="https://slack.shop/" data-qa="slack_shop" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_slack_shop">Slack Shop</a></li>
-				</ul>
-			</div>
-			<div class="col span_1_of_4 nav_col">
-				<ul>
-					<li class="cat_3">Legal</li>
-					<li><a href="/privacy-policy" data-qa="privacy" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_privacy">Privacy</a></li>
-					<li><a href="/security" data-qa="security" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_security">Security</a></li>
-					<li><a href="/terms-of-service" data-qa="tos" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_tos">Terms of Service</a></li>
-					<li><a href="/policies" data-qa="policies" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_policies">Policies</a></li>
-				</ul>
-			</div>
-			<div class="col span_1_of_4 nav_col">
-				<ul>
-					<li class="cat_4">Handy Links</li>
-					<li><a href="/downloads" data-qa="downloads" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_downloads">Download desktop app</a></li>
-					<li><a href="/downloads" data-qa="downloads_mobile" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_downloads_mobile">Download mobile app</a></li>
-					<li><a href="/brand-guidelines" data-qa="brand_guidelines" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_brand_guidelines">Brand Guidelines</a></li>
-					<li><a href="https://slackatwork.com" data-qa="slack_at_work" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_slack_at_work">Slack at Work</a></li>
-					<li><a href="https://status.slack.com/" data-qa="status" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_status">Status</a></li>
-				</ul>
-			</div>
-		</div>
-	</section>
-
-	<div class="footnote">
-		<section>
-			<a href="https://slack.com" aria-label="Slack homepage" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_slack_icon"><ts-icon class="ts_icon_slack_pillow" aria-hidden="true"></ts-icon></a>
-			<ul>
-				<li>
-					<a href="/help/contact" data-qa="contact_us" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_contact_us">Contact Us</a>
-				</li>
-				<li>
-					<a href="https://twitter.com/SlackHQ" data-qa="slack_twitter" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_slack_twitter" aria-label="Slack on Twitter"><ts-icon class="ts_icon_twitter" aria-hidden="true"></ts-icon></a>
-				</li>
-				<li class="yt">
-					<a href="https://www.youtube.com/channel/UCY3YECgeBcLCzIrFLP4gblw" data-qa="slack_youtube" data-clog-event="WEBSITE_CLICK" data-clog-params="click_target=footer_slack_youtube" aria-label="Slack on YouTube"><ts-icon class="ts_icon_youtube" aria-hidden="true"></ts-icon></a>
-				</li>
-			</ul>
-		</section>
-	</div>
-</footer>
-
-
-
-
-
-<script type="text/javascript">
-
-	/**
-	 * A placeholder function that the build script uses to
-	 * replace file paths with their CDN versions.
-	 *
-	 * @param {String} file_path - File path
-	 * @returns {String}
-	 */
-	function vvv(file_path) {
-
-		var vvv_warning = 'You cannot use vvv on dynamic values. Please make sure you only pass in static file paths.';
-		if (TS && TS.warn) {
-			TS.warn(vvv_warning);
-		} else {
-			console.warn(vvv_warning);
-		}
-
-		return file_path;
-	}
-
-	var cdn_url = "https:\/\/a.slack-edge.com";
-	var vvv_abs_url = "https:\/\/slack.com\/";
-	var inc_js_setup_data = {
-			emoji_sheets: {
-			apple: 'https://a.slack-edge.com/c00d19/img/emoji_2017_12_06/sheet_apple_64_indexed_256.png',
-			google: 'https://a.slack-edge.com/c00d19/img/emoji_2017_12_06/sheet_google_64_indexed_256.png',
-		},
-		emoji5: true,
-		};
-</script>
-	<script type="text/javascript">
-<!--
-	// common boot_data
-	var boot_data = {
-		start_ms: Date.now(),
-		app: "web",
-		user_id: '',
-		team_id: 'T00',
-		visitor_uid: "1c68s3w3u87400ccogskc4o4c",
-		no_login: true,
-		version_ts: "1521903667",
-		version_uid: "994744788f157f504d4123016987a792d9ade09c",
-		cache_version: "v16-giraffe",
-		cache_ts_version: "v2-bunny",
-		redir_domain: "slack-redir.net",
-		signin_url: 'https://slack.com/signin',
-		abs_root_url: "https:\/\/slack.com\/",
-		api_url: '/api/',
-		team_url: "",
-		image_proxy_url: "https:\/\/slack-imgs.com\/",
-		beacon_timing_url: "https:\/\/slack.com\/beacon\/timing",
-		beacon_error_url: "https:\/\/slack.com\/beacon\/error",
-		clog_url: "clog\/track\/",
-		api_token: "",
-		ls_disabled: false,
-		hc_tracking_qs: "",
-
-		vvv_paths: {
-			
-		lz_string: "https:\/\/a.slack-edge.com\/bv1-1\/lz-string-1.4.4.worker.8de1b00d670ff3dc706a0.js",
-		codemirror: "https:\/\/a.slack-edge.com\/bv1-1\/codemirror.min.44a2b0ae2d7a5cac8a95.min.js",
-	codemirror_addon_simple: "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_simple.9c76f7896754967b9eda.min.js",
-	codemirror_load: "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_load.ca4f26b018edcede90ce.min.js",
-
-	// Silly long list of every possible file that Codemirror might load
-	codemirror_files: {
-		'apl': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_apl.28ce658730a18a115532.min.js",
-		'asciiarmor': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_asciiarmor.b6cae5185b1e92ac1917.min.js",
-		'asn.1': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_asn.1.1992736a46ff4b01f93f.min.js",
-		'asterisk': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_asterisk.8dc14a25826407ab1fa3.min.js",
-		'brainfuck': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_brainfuck.d29773c7ac178228d4c1.min.js",
-		'clike': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_clike.cccd21c94a2b7ab7ce3d.min.js",
-		'clojure': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_clojure.4a91a0c50a64467f2ff5.min.js",
-		'cmake': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_cmake.a873ff1604fb8e89955f.min.js",
-		'cobol': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_cobol.2b7098fad4936f18f361.min.js",
-		'coffeescript': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_coffeescript.68a8fdd315d0dcf8c27a.min.js",
-		'commonlisp': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_commonlisp.879f5b578b25a058fc4d.min.js",
-		'css': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_css.035ca224464953138c30.min.js",
-		'crystal': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_crystal.79beb330be1a294e43c4.min.js",
-		'cypher': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_cypher.525ea24cf7710ac2825a.min.js",
-		'd': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_d.7328ff9ab8c98103deb7.min.js",
-		'dart': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_dart.f7e22fcf397d31e7af93.min.js",
-		'diff': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_diff.c3b6cf00600144071d6d.min.js",
-		'django': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_django.cde302c62fe6365529f2.min.js",
-		'dockerfile': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_dockerfile.ed0e37e03b2023e1b69b.min.js",
-		'dtd': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_dtd.df3795754645134d5f80.min.js",
-		'dylan': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_dylan.fed72f1d0e846fd6d213.min.js",
-		'ebnf': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_ebnf.6af113fdedf587f96c64.min.js",
-		'ecl': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_ecl.12b9206b24a5433649ab.min.js",
-		'eiffel': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_eiffel.896ceb473406cc01ee59.min.js",
-		'elm': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_elm.637ce7bda68e33c4b55a.min.js",
-		'erlang': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_erlang.ea42edc0caacbb7b9429.min.js",
-		'factor': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_factor.937f3b4ba675a2abe9c7.min.js",
-		'forth': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_forth.89f6ec54d5548d4cf25b.min.js",
-		'fortran': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_fortran.e312d7972b690a22beab.min.js",
-		'gas': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_gas.abc6e9d7c3a0b887ff69.min.js",
-		'gfm': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_gfm.8fc0c8e3735d10a858c6.min.js",
-		'gherkin': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_gherkin.9e0cfa25c1965e495419.min.js",
-		'go': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_go.5ed96d85ab19d7795ba7.min.js",
-		'groovy': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_groovy.c496c31bd5cca0986ead.min.js",
-		'haml': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_haml.f25c65cf09f1ec3a29c7.min.js",
-		'handlebars': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_handlebars.80eb7b9e2e0fb6dee382.min.js",
-		'haskell': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_haskell.e7b2cc288c6bd281ff32.min.js",
-		'haxe': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_haxe.3efebdfa3dc7fb7cc4db.min.js",
-		'htmlembedded': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_htmlembedded.1a2496c621f9a470c340.min.js",
-		'htmlmixed': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_htmlmixed.caa675603dc4fdb90c31.min.js",
-		'http': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_http.c1c249d14bf18521fee1.min.js",
-		'idl': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_idl.715601d44fbe133c065b.min.js",
-		'jade': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_jade.0eff9474d977d43feced.min.js",
-		'javascript': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_javascript.bc1b5c6a6515b3064108.min.js",
-		'jinja2': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_jinja2.5de8bc52face9b2769f2.min.js",
-		'julia': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_julia.32d8748fecc17e6305bf.min.js",
-		'livescript': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_livescript.f6dbad1e8d8168b319f4.min.js",
-		'lua': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_lua.32780d85e5cbbb59b8eb.min.js",
-		'markdown': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_markdown.a7f65f93ece1f31b9e60.min.js",
-		'mathematica': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_mathematica.48dd3694f2f71a75544c.min.js",
-		'mirc': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_mirc.0f3984162d72c3a0a5ca.min.js",
-		'mllike': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_mllike.e4e86126535bd4f7a575.min.js",
-		'modelica': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_modelica.d4fd8938619f5c8dc361.min.js",
-		'mscgen': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_mscgen.f9d5ab8e95b697c39880.min.js",
-		'mumps': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_mumps.b361377133b59678d3d5.min.js",
-		'nginx': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_nginx.524bfc39589c37f74bfd.min.js",
-		'nsis': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_nsis.b25852c3418f984ae03d.min.js",
-		'ntriples': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_ntriples.4e0443a64025c35438a6.min.js",
-		'octave': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_octave.3a0c99a5e07bbd9a6d67.min.js",
-		'oz': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_oz.e9939d375a47087f59aa.min.js",
-		'pascal': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_pascal.f1162aeab4a781363ccd.min.js",
-		'pegjs': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_pegjs.7af50308b76ba3251b02.min.js",
-		'perl': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_perl.5a7940afe30ba510820a.min.js",
-		'php': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_php.64b619fb529d1cd9b781.min.js",
-		'pig': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_pig.a30ec6f3ffff33476ac4.min.js",
-		'powershell': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_powershell.0ccd1b6a33eb2209c15b.min.js",
-		'properties': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_properties.5c0c1436978bf2a7af00.min.js",
-		'puppet': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_puppet.53ac0d4fadd68369610e.min.js",
-		'python': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_python.dd3e2e25db7e7fb868d6.min.js",
-		'q': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_q.4af8c1d9b07ea218977f.min.js",
-		'r': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_r.783001720b360a8177a8.min.js",
-		'rpm': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_rpm.79678546fb25c75e3208.min.js",
-		'rst': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_rst.0fa19c56ae79c0b70c27.min.js",
-		'ruby': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_ruby.efce7fd348530776314b.min.js",
-		'rust': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_rust.b148ea62a65dfe9f36c0.min.js",
-		'sass': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_sass.4e58ddf440975d3864f6.min.js",
-		'scheme': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_scheme.52a48304089db7f7708e.min.js",
-		'shell': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_shell.8dd47832ce011f080fb8.min.js",
-		'sieve': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_sieve.dc92cd9b919e5efb3c05.min.js",
-		'slim': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_slim.ba0d300bced932d16420.min.js",
-		'smalltalk': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_smalltalk.6dd6e1d419b04500b385.min.js",
-		'smarty': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_smarty.428329a9fdb0d8be2a5f.min.js",
-		'solr': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_solr.02f1fe78feb4a670b6cc.min.js",
-		'soy': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_soy.8145a09e761fee4b0667.min.js",
-		'sparql': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_sparql.cf7a2190284c6ca0c11d.min.js",
-		'spreadsheet': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_spreadsheet.eeeb35132617f7fa05e6.min.js",
-		'sql': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_sql.78a665f0a117e62e46f2.min.js",
-		'stex': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_stex.777bff71a93e84be5096.min.js",
-		'stylus': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_stylus.6ae0e46fb8c0750c644c.min.js",
-		'swift': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_swift.2254c736e8a7f4f51e92.min.js",
-		'tcl': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_tcl.13833d90818d7aa20cc6.min.js",
-		'textile': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_textile.aa7de5d427d0474f6e14.min.js",
-		'tiddlywiki': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_tiddlywiki.efa88c874dc2653bb47e.min.js",
-		'tiki': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_tiki.6a8e59872a533ec09dae.min.js",
-		'toml': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_toml.4e099e2ec0d834eb7c04.min.js",
-		'tornado': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_tornado.feede7e509e683f0998f.min.js",
-		'troff': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_troff.d31a17f22f8c679cf3e5.min.js",
-		'ttcn': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_ttcn.1bf6637cf05b45897ccd.min.js",
-		'ttcn:cfg': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_ttcn-cfg.273e541df1ddc66215ca.min.js",
-		'turtle': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_turtle.4cf803c3d74096bfb82a.min.js",
-		'twig': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_twig.628d79da0aea153a66fe.min.js",
-		'vb': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_vb.828b80361395c4e24aaf.min.js",
-		'vbscript': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_vbscript.e19473b2883a8f5e9270.min.js",
-		'velocity': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_velocity.09039c2d8f038c5046b2.min.js",
-		'verilog': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_verilog.f12abef9991c95696bf5.min.js",
-		'vhdl': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_vhdl.6438b130790bb71537f5.min.js",
-		'vue': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_vue.b7dca682b49e1cb360cf.min.js",
-		'xml': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_xml.c067158d12d43b9b96f7.min.js",
-		'xquery': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_xquery.340466967c2bdf65fa66.min.js",
-		'yaml': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_yaml.7f71c0f462159ba81033.min.js",
-		'z80': "https:\/\/a.slack-edge.com\/bv1-1\/codemirror_lang_z80.73d5eb24ebcdece24ced.min.js"
-	}		},
-
-		notification_sounds: [{"value":"b2.mp3","label":"Ding","url":"https:\/\/slack.global.ssl.fastly.net\/7e91\/sounds\/push\/b2.mp3","url_ogg":"https:\/\/slack.global.ssl.fastly.net\/46ebb\/sounds\/push\/b2.ogg"},{"value":"animal_stick.mp3","label":"Boing","url":"https:\/\/slack.global.ssl.fastly.net\/7e91\/sounds\/push\/animal_stick.mp3","url_ogg":"https:\/\/slack.global.ssl.fastly.net\/46ebb\/sounds\/push\/animal_stick.ogg"},{"value":"been_tree.mp3","label":"Drop","url":"https:\/\/slack.global.ssl.fastly.net\/7e91\/sounds\/push\/been_tree.mp3","url_ogg":"https:\/\/slack.global.ssl.fastly.net\/46ebb\/sounds\/push\/been_tree.ogg"},{"value":"complete_quest_requirement.mp3","label":"Ta-da","url":"https:\/\/slack.global.ssl.fastly.net\/7e91\/sounds\/push\/complete_quest_requirement.mp3","url_ogg":"https:\/\/slack.global.ssl.fastly.net\/46ebb\/sounds\/push\/complete_quest_requirement.ogg"},{"value":"confirm_delivery.mp3","label":"Plink","url":"https:\/\/slack.global.ssl.fastly.net\/7e91\/sounds\/push\/confirm_delivery.mp3","url_ogg":"https:\/\/slack.global.ssl.fastly.net\/46ebb\/sounds\/push\/confirm_delivery.ogg"},{"value":"flitterbug.mp3","label":"Wow","url":"https:\/\/slack.global.ssl.fastly.net\/7e91\/sounds\/push\/flitterbug.mp3","url_ogg":"https:\/\/slack.global.ssl.fastly.net\/46ebb\/sounds\/push\/flitterbug.ogg"},{"value":"here_you_go_lighter.mp3","label":"Here you go","url":"https:\/\/slack.global.ssl.fastly.net\/7e91\/sounds\/push\/here_you_go_lighter.mp3","url_ogg":"https:\/\/slack.global.ssl.fastly.net\/46ebb\/sounds\/push\/here_you_go_lighter.ogg"},{"value":"hi_flowers_hit.mp3","label":"Hi","url":"https:\/\/slack.global.ssl.fastly.net\/7e91\/sounds\/push\/hi_flowers_hit.mp3","url_ogg":"https:\/\/slack.global.ssl.fastly.net\/46ebb\/sounds\/push\/hi_flowers_hit.ogg"},{"value":"knock_brush.mp3","label":"Knock Brush","url":"https:\/\/slack.global.ssl.fastly.net\/7e91\/sounds\/push\/knock_brush.mp3","url_ogg":"https:\/\/slack.global.ssl.fastly.net\/46ebb\/sounds\/push\/knock_brush.ogg"},{"value":"save_and_checkout.mp3","label":"Whoa!","url":"https:\/\/slack.global.ssl.fastly.net\/7e91\/sounds\/push\/save_and_checkout.mp3","url_ogg":"https:\/\/slack.global.ssl.fastly.net\/46ebb\/sounds\/push\/save_and_checkout.ogg"},{"value":"item_pickup.mp3","label":"Yoink","url":"https:\/\/slack.global.ssl.fastly.net\/7e91\/sounds\/push\/item_pickup.mp3","url_ogg":"https:\/\/slack.global.ssl.fastly.net\/46ebb\/sounds\/push\/item_pickup.ogg"},{"value":"hummus.mp3","label":"Hummus","url":"https:\/\/slack.global.ssl.fastly.net\/7fa9\/sounds\/push\/hummus.mp3","url_ogg":"https:\/\/slack.global.ssl.fastly.net\/46ebb\/sounds\/push\/hummus.ogg"},{"value":"none","label":"None"}],
-		alert_sounds: [{"value":"frog.mp3","label":"Frog","url":"https:\/\/slack.global.ssl.fastly.net\/a34a\/sounds\/frog.mp3"}],
-		call_sounds: [{"value":"call\/alert_v2.mp3","label":"Alert","url":"https:\/\/slack.global.ssl.fastly.net\/08f7\/sounds\/call\/alert_v2.mp3"},{"value":"call\/incoming_ring_v2.mp3","label":"Incoming ring","url":"https:\/\/slack.global.ssl.fastly.net\/08f7\/sounds\/call\/incoming_ring_v2.mp3"},{"value":"call\/outgoing_ring_v2.mp3","label":"Outgoing ring","url":"https:\/\/slack.global.ssl.fastly.net\/08f7\/sounds\/call\/outgoing_ring_v2.mp3"},{"value":"call\/pop_v2.mp3","label":"Incoming reaction","url":"https:\/\/slack.global.ssl.fastly.net\/08f7\/sounds\/call\/pop_v2.mp3"},{"value":"call\/they_left_call_v2.mp3","label":"They left call","url":"https:\/\/slack.global.ssl.fastly.net\/08f7\/sounds\/call\/they_left_call_v2.mp3"},{"value":"call\/you_left_call_v2.mp3","label":"You left call","url":"https:\/\/slack.global.ssl.fastly.net\/08f7\/sounds\/call\/you_left_call_v2.mp3"},{"value":"call\/they_joined_call_v2.mp3","label":"They joined call","url":"https:\/\/slack.global.ssl.fastly.net\/08f7\/sounds\/call\/they_joined_call_v2.mp3"},{"value":"call\/you_joined_call_v2.mp3","label":"You joined call","url":"https:\/\/slack.global.ssl.fastly.net\/08f7\/sounds\/call\/you_joined_call_v2.mp3"},{"value":"call\/confirmation_v2.mp3","label":"Confirmation","url":"https:\/\/slack.global.ssl.fastly.net\/08f7\/sounds\/call\/confirmation_v2.mp3"}],
-		call_sounds_version: "v2",
-				default_tz: "America\/Los_Angeles",
-		
-		feature_tinyspeck: false,
-		feature_create_team_google_auth: false,
-		feature_enterprise_custom_tos: true,
-		feature_webapp_always_collect_initial_time_period_stats: false,
-		feature_search_skip_context: false,
-		feature_buildy_css: false,
-		feature_flannel_use_canary_sometimes: false,
-		feature_deprecate_window_cert: true,
-		feature_deprecate_window_cert_block: true,
-		feature_deprecate_files: false,
-		feature_deprecate_get_member_by_name: false,
-		feature_usergroup_highlight_words: true,
-		feature_prev_reached_end: true,
-		feature_modern_upsert_file: true,
-		feature_file_threads: false,
-		feature_file_threads_cache_update: false,
-		feature_more_pins_info: false,
-		feature_threads_perf: false,
-		feature_message_replies_inline: false,
-		feature_subteam_members_diff: true,
-		feature_a11y_keyboard_shortcuts: false,
-		feature_email_ingestion: false,
-		feature_api_site_tools: false,
-		feature_msg_consistency: false,
-		feature_sidebar_context_menu: false,
-		feature_attachments_inline: false,
-		feature_fix_files: true,
-		feature_channel_eventlog_client: true,
-		feature_paging_api: false,
-		feature_custom_status_expiry: false,
-		feature_m11n_custom_status_input: false,
-		feature_sonic_dnd: false,
-		feature_enterprise_app_teams: true,
-		feature_enterprise_frecency: true,
-		feature_ent_app_management_dashboard: true,
-		feature_set_away_dialog_behavior: true,
-		feature_ent_app_management_restriction: false,
-		feature_entitlements: true,
-		feature_grid_archive_link_fixes: true,
-		feature_dunning: true,
-		feature_invoice_dunning: true,
-		feature_safeguard_org_retention: true,
-		feature_dashboard_sortable_lists: false,
-		feature_refactor_admin_stats: false,
-		feature_invite_only_workspaces: true,
-		feature_leave_workspace_improvements: true,
-		feature_enteprise_user_teams_update: false,
-		feature_enterprise_org_wide_channels_section: true,
-		feature_show_billing_active_for_grid: true,
-		feature_find_your_workspace: false,
-		feature_compliance_export_helper_copy: false,
-		feature_form_text_character_count_copy: false,
-		feature_sk_lato_cleanup: false,
-		feature_saml_authn_key_expiry_date: true,
-		feature_wta_client_support: true,
-		feature_xoxa_channel_authorization: true,
-		feature_wta_optional_ephemeral_message: false,
-		feature_file_links_betterer: false,
-		feature_enterprise_dm_deeplink: false,
-		feature_session_duration_saved_message: false,
-		feature_guest_api_changes: false,
-		feature_sso_jit_disabling: true,
-		feature_flannel_start_user_specific_props: false,
-		feature_channel_alert_words: false,
-		feature_connecting_shared_channels_enterprise: false,
-		feature_shared_channels_enterprise: false,
-		feature_snapshots_the_revenge: false,
-		feature_mpim_channels: false,
-		feature_esc_connected_workspaces_search: false,
-		feature_deprecate_gateways: true,
-		feature_conversations_list: true,
-		feature_gdpr_user_join_tos: false,
-		feature_modernize_admin: false,
-		feature_winssb_beta_channel: false,
-		feature_slack_astronaut_i18n_jpn: true,
-		feature_i18n_customer_stories: false,
-		feature_cust_acq_i18n_tweaks: false,
-		feature_gdpr_website_update: true,
-		feature_gdpr_website_fixes: false,
-		feature_gdpr_forget_user: false,
-		feature_sales_lp: true,
-		feature_presence_sub: true,
-		feature_whitelist_zendesk_chat_widget: false,
-		feature_live_support_free_plan: false,
-		feature_slackbot_goes_to_college: false,
-		feature_newxp_enqueue_message: true,
-		feature_teambot: false,
-		feature_star_shortcut: false,
-		feature_show_jumper_scores: true,
-		feature_force_ls_compression: false,
-		feature_name_tagging_client: true,
-		feature_name_tagging_client_autocomplete: false,
-		feature_name_tagging_client_topic_purpose: false,
-		feature_use_imgproxy_resizing: true,
-		feature_share_mention_comment_cleanup: false,
-		feature_external_files: false,
-		feature_electron_memory_logging: false,
-		feature_no_title_markup: true,
-		feature_channel_exports: false,
-		feature_corp_eng_news: false,
-		feature_take_profile_photo: false,
-		feature_arugula: false,
-		feature_texty_rewrite_on_paste: false,
-		feature_deprecate_screenhero: true,
-		feature_calls_esc_ui: true,
-		feature_toggle_id_translation: true,
-		feature_modern_api_q: false,
-		feature_default_shared_channels: true,
-		feature_default_shared_channels_whats_new: true,
-		feature_email_notifications_improvements: true,
-		feature_react_lfs: false,
-		feature_log_quickswitcher_queries: true,
-		feature_enable_mdm: true,
-		feature_message_menus: true,
-		feature_new_message_click_logging: true,
-		feature_announce_only_channels: false,
-		feature_app_permissions_backend_enterprise: true,
-		feature_token_ip_whitelist: true,
-		feature_hide_join_leave: false,
-		feature_rollback_to_mapping: false,
-		feature_emoji5: true,
-		feature_sidebar_theme_undo: false,
-		feature_emoji5_dark_launch: true,
-		feature_feature_emoji5: false,
-		feature_allow_intra_word_formatting: true,
-		feature_allow_cjk_autocomplete: true,
-		feature_allow_split_word: false,
-		feature_i18n_channels_validate_emoji: true,
-		feature_slim_scrollbar: false,
-		feature_search_query_refinements: true,
-		feature_react_search: false,
-		feature_prefs_modernization: false,
-		feature_sidebar_filters: false,
-		feature_sli_channel_archive_suggestions: true,
-		feature_unread_counts_without_history: true,
-		feature_react_messages: true,
-		feature_clipboard_contents: false,
-		feature_redux_modals: false,
-		feature_react_pin_author: true,
-		feature_mrkdwn_truncation: true,
-		feature_m11n_channels_join: true,
-		feature_m11n_metrics_responsiveness: false,
-		feature_react_member_profile_card: false,
-		feature_service_import_lfs: false,
-		feature_mpdm_default_fe: false,
-		feature_channel_notif_dialog_update: false,
-		feature_oauth_react_wta: false,
-		feature_react_team_picker: false,
-		feature_app_index: false,
-		feature_app_profile_app_site_link: false,
-		feature_custom_app_installs: false,
-		feature_gdrive_do_not_install_by_default: true,
-		feature_delete_moved_channels: true,
-		feature_single_workspace_redirect: true,
-		feature_zero_workspace_onboarding: true,
-		feature_user_tos: false,
-		feature_oom_mv_channels_list: false,
-		feature_solr_discoverability: true,
-		feature_sso_formatting_error: false,
-		feature_single_user_workspace_pagination: true,
-		feature_default_workspaces_to_closed: true,
-		feature_ms_msg_handlers_profiling: true,
-		feature_cross_workspace_quick_switcher_prototype: true,
-		feature_org_quick_switcher: false,
-		feature_user_prefs_merge_using_custom_callbacks: true,
-		feature_ms_latest: true,
-		feature_no_preload_video: true,
-		feature_guests_use_entitlements: true,
-		feature_emoji_picker_frecently_used: false,
-		feature_app_space: true,
-		feature_app_canvases: false,
-		feature_canvases: false,
-		feature_stop_loud_channel_mentions: false,
-		feature_message_input_byte_limit: false,
-		feature_beacon_js_errors: false,
-		feature_dialogs_v2_mobile: false,
-		feature_user_app_disable_speed_bump: false,
-		feature_nudge_team_creators: false,
-		feature_onedrive_picker: false,
-		feature_lesson_onboarding: true,
-		feature_disable_join_notifications: false,
-		feature_api_admin_page_not_ent: true,
-		feature_faster_channels_browser_render: true,
-		feature_non_blocking_user_boot: true,
-		feature_non_wasted_flannel_connection: true,
-		feature_no_files_info: true,
-		feature_less_pins: true,
-		feature_runaway_qs: false,
-		feature_dark_qs: false,
-		feature_delete_team_and_apps: true,
-		feature_email_forwarding: true,
-		feature_pjpeg: false,
-		feature_pdf_thumb: true,
-		feature_apps_manage_permissions_scope_changes: true,
-		feature_app_dir_only_default_true: false,
-		feature_reminder_cross_workspace: false,
-		feature_speedy_boot_handlebars: false,
-		feature_wta_web_flannel_membership: true,
-		feature_better_web_app_model: false,
-		feature_channel_invite_modal_cannot_join: false,
-		feature_expiring_credits: true,
-		feature_email_prefs: true,
-		feature_pricing_calculator: false,
-		feature_sonic: false,
-		feature_flannel_channels_v0: false,
-		feature_flannel_always_use_canary: false,
-		feature_lazy_channels: false,
-		feature_webclient_load_status_site: true,
-		feature_react_channel_header: false,
-		feature_global_nav: false,
-		feature_message_spacing: false,
-		feature_shortcuts_flexpane: true,
-		feature_app_directory_home_page_redesign: true,
-		feature_hidden_wksp_unfurls: false,
-		feature_guest_wksp_unfurls: false,
-		feature_workspace_scim_management: false,
-		feature_email_previewer: false,
-		feature_redux_dev_tools: false,
-		feature_unified_member: false,
-		feature_turn_mpdm_notifs_on: true,
-		feature_browser_dragndrop: false,
-		feature_granular_shared_channel_perms: false,
-		feature_org_detailed_thread_mentions: true,
-		feature_force_production_channel: false,
-		feature_quill_upgrade: true,
-		feature_offline_hint: false,
-		feature_aria_msg_summary: false,
-		feature_emoji_substr_search: false,
-		feature_texty_formatting_commands: false,
-		feature_texty_change_queue: false,
-		feature_send_button_for_everyone: false,
-		feature_shortcuts_prompt: true,
-		feature_accessible_dialogs: true,
-		feature_app_actions: false,
-		feature_app_actions_fe: false,
-		feature_app_actions_fe_frecency: false,
-		feature_app_actions_response_url: true,
-		feature_shared_channel_free_trial_flow: true,
-		feature_i18n_compliance_links: false,
-		feature_calls_clipboard_broadcasting_optin: true,
-		feature_autocomplete_files: true,
-		feature_screen_share_needs_aero: false,
-		feature_calls_disable_iss_admin: true,
-		feature_sidebar_realtime_priority: false,
-		feature_in_prod_trials: true,
-		feature_billing_ce_request_last4: true,
-		feature_sli_explore: false,
-		feature_sli_trending_dashboard: false,
-		feature_i18n_custom_status: false,
-		feature_i18n_select_empty_state_string: false,
-		feature_drift_on_plans_page: true,
-		feature_cjk_highlight_words: false,
-		feature_accessible_fs_dialogs: true,
-		feature_channel_browser_dropdown: true,
-		feature_slackday_unsent_msg_sync: false,
-		feature_trap_kb_within_fs_modals: true,
-		feature_date_picker: false,
-
-	client_logs: {"0":{"numbers":[0],"user_facing":false},"2":{"numbers":[2],"user_facing":false},"4":{"numbers":[4],"user_facing":false},"5":{"numbers":[5],"user_facing":false},"23":{"numbers":[23],"user_facing":false},"sounds":{"name":"sounds","numbers":[37]},"37":{"name":"sounds","numbers":[37],"user_facing":true},"47":{"numbers":[47],"user_facing":false},"48":{"numbers":[48],"user_facing":false},"Message History":{"name":"Message History","numbers":[58]},"58":{"name":"Message History","numbers":[58],"user_facing":true},"67":{"numbers":[67],"user_facing":false},"72":{"numbers":[72],"user_facing":false},"73":{"numbers":[73],"user_facing":false},"82":{"numbers":[82],"user_facing":false},"88":{"numbers":[88],"user_facing":false},"91":{"numbers":[91],"user_facing":false},"93":{"numbers":[93],"user_facing":false},"96":{"numbers":[96],"user_facing":false},"99":{"numbers":[99],"user_facing":false},"Channel Marking (MS)":{"name":"Channel Marking (MS)","numbers":[141]},"141":{"name":"Channel Marking (MS)","numbers":[141],"user_facing":true},"Channel Marking (Client)":{"name":"Channel Marking (Client)","numbers":[142]},"142":{"name":"Channel Marking (Client)","numbers":[142],"user_facing":true},"Close Old IMs (Client)":{"name":"Close Old IMs (Client)","numbers":[221]},"221":{"name":"Close Old IMs (Client)","numbers":[221],"user_facing":true},"365":{"numbers":[365],"user_facing":false},"389":{"numbers":[389],"user_facing":false},"438":{"numbers":[438],"user_facing":false},"444":{"numbers":[444],"user_facing":false},"481":{"numbers":[481],"user_facing":false},"488":{"numbers":[488],"user_facing":false},"529":{"numbers":[529],"user_facing":false},"552":{"numbers":[552],"user_facing":false},"dashboard":{"name":"dashboard","numbers":[666]},"666":{"name":"dashboard","numbers":[666],"user_facing":false},"667":{"numbers":[667],"user_facing":false},"773":{"numbers":[773],"user_facing":false},"777":{"numbers":[777],"user_facing":false},"794":{"numbers":[794],"user_facing":false},"Client Responsiveness":{"name":"Client Responsiveness","user_facing":false,"numbers":[808]},"808":{"name":"Client Responsiveness","user_facing":false,"numbers":[808]},"Message Pane Scrolling":{"name":"Message Pane Scrolling","numbers":[888]},"888":{"name":"Message Pane Scrolling","numbers":[888],"user_facing":true},"Unread banner and divider":{"name":"Unread banner and divider","numbers":[999]},"999":{"name":"Unread banner and divider","numbers":[999],"user_facing":true},"1000":{"numbers":[1000],"user_facing":false},"Duplicate badges (desktop app icons)":{"name":"Duplicate badges (desktop app icons)","numbers":[1701]},"1701":{"name":"Duplicate badges (desktop app icons)","numbers":[1701],"user_facing":true},"Members":{"name":"Members","numbers":[1975]},"1975":{"name":"Members","numbers":[1975],"user_facing":true},"lazy loading":{"name":"lazy loading","numbers":[1989]},"1989":{"name":"lazy loading","numbers":[1989],"user_facing":true},"thin_channel_membership":{"name":"thin_channel_membership","numbers":[1990]},"1990":{"name":"thin_channel_membership","numbers":[1990],"user_facing":true},"stats":{"name":"stats","numbers":[1991]},"1991":{"name":"stats","numbers":[1991],"user_facing":true},"ms":{"name":"ms","numbers":[1996]},"1996":{"name":"ms","numbers":[1996],"user_facing":true},"shared_channels_connection":{"name":"shared_channels_connection","numbers":[1999]},"1999":{"name":"shared_channels_connection","numbers":[1999],"user_facing":false},"dnd":{"name":"dnd","numbers":[2002]},"2002":{"name":"dnd","numbers":[2002],"user_facing":true},"2003":{"numbers":[2003],"user_facing":false},"Threads":{"name":"Threads","numbers":[2004]},"2004":{"name":"Threads","numbers":[2004],"user_facing":true},"2005":{"numbers":[2005],"user_facing":false},"Reactions":{"name":"Reactions","numbers":[2006]},"2006":{"name":"Reactions","numbers":[2006],"user_facing":true},"TSSSB.focusTabAndSwitchToChannel":{"name":"TSSSB.focusTabAndSwitchToChannel","numbers":[2007]},"2007":{"name":"TSSSB.focusTabAndSwitchToChannel","numbers":[2007],"user_facing":false},"Presence Detection":{"name":"Presence Detection","numbers":[2017]},"2017":{"name":"Presence Detection","numbers":[2017],"user_facing":true},"mc_sibs":{"name":"mc_sibs","numbers":[9999]},"9999":{"name":"mc_sibs","numbers":[9999],"user_facing":false},"Member searching":{"name":"Member searching","numbers":[90211]},"90211":{"name":"Member searching","numbers":[90211],"user_facing":true},"98765":{"numbers":[98765],"user_facing":false},"8675309":{"numbers":[8675309],"user_facing":false}},
-
-
-		img: {
-			app_icon: 'https://a.slack-edge.com/272a/img/slack_growl_icon.png'
-		},
-		page_needs_custom_emoji: false,
-		page_needs_enterprise: false	};
-
-	
-	
-	
-	
-	// i18n locale map (eg: maps Slack `ja-jp` to ZD `ja`)
-			boot_data.slack_to_zd_locale = {"en-us":"en-us","fr-fr":"fr-fr","de-de":"de","es-es":"es","ja-jp":"ja"};
-	
-	// client boot data
-		
-		
-	
-	
-	
-	
-	
-	// inline_emoji
-	boot_data.pref_emoji_mode = "";
-	boot_data.pref_jumbomoji = 0;
-	boot_data.pref_messages_theme = "";
-
-//-->
-</script>
-		
-
-
-
-
-		
-	<!-- output_js "libs" -->
-<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/emoji_5.f765b7e9a668291cfd7b.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
-<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/rollup-core_required_libs.af62e9923ce51b4388b1.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
-
-	<!-- output_js "application" -->
-<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/modern.vendor.0f49c13c69baa69c3708.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
-<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/application.1d5a2d2ff6bbe0cb5dad.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
-
-	<!-- output_js "page" -->
-
-		<!-- output_js "core" -->
-<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/rollup-core_required_ts.5a3642bdde417e2d3177.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
-<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/TS.web.2c57080d6fe5283395da.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
-<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/signals.224faae8b29600405855.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
-
-	<!-- output_js "core_web" -->
-<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/rollup-core_web.a85b39d79e64ec97e665.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
-
-	<!-- output_js "secondary" -->
-<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/rollup-secondary_a_required.9b15da5570fdd482bb55.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
-<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/rollup-secondary_b_required.47f564d0377c78b3f52e.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
-
-				
-	
-	<script type="text/javascript">TS.boot(boot_data);</script>
-
-	<!-- output_js "regular" -->
-<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/sticky_nav.f3e5d3f5201730db38d8.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
-<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/warn_capslock.e3fce2fe58977d4811e7.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
-<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/spin.749a1a852d3b17985a6b.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
-<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/ladda.47f0b0a3f70f3894aec8.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
-<script type="text/javascript" src="https://a.slack-edge.com/bv1-1/footer.fc6c556e22abc288b9f4.min.js" crossorigin="anonymous" onload="window._cdn && _cdn.ok(this, arguments)" onerror="window._cdn && _cdn.failed(this, arguments)"></script>
-
-
-			<script type="text/javascript">
-					
-				setTimeout(function() {
-					$('input[name="email"]').val() ? $('input[name="password"]').focus() : $('input').filter(':visible:first').focus(); 
-				}, 100);
-			
-						
-			if (navigator.userAgent.match(/windows phone/i)) {
-				$('input[name="password"]').css('font-family', 'sans-serif,arial,verdana,tahoma');
-			}
-		
-
-		
-
-		var $signin_btn = $('#signin_btn');
-		$signin_btn.data('ladda', Ladda.create(document.querySelector('#signin_btn')));
-
-		var no_sso = false;
-		var team_id = 'T9HCC7JHH';
-		var email_regex = new RegExp("[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", 'i');
-
-		// signin form
-		$('#signin_form').on('submit', function(e) {
-
-			var email = $.trim($('#email').val());
-			var password = $.trim($('#password').val());
-
-			// no email or invalid email
-			if (!email || !email_regex.test(email)) {
-				$('#email').focus().closest('p').addClass('error');
-				e.preventDefault();
-				return;
-			}
-
-			// no password
-			if (!password) {
-				$('#password').focus().closest('p').addClass('error');
-				e.preventDefault();
-				return;
-			}
-
-			// Prevent the form from submitting twice, which causes the following SSB signin bug:
-			// https://slack-bugs.tinyspeck.com/14961
-			$signin_btn.attr('disabled', true);
-			$signin_btn.attr('aria-disabled', true);
-			$signin_btn.data('ladda').start();
-		});
-
-		// magic login signin form
-		$('#signin_form_magic').on('submit', function(e) {
-
-			e.preventDefault();
-			var email = $.trim($('#email').val());
-
-			// no email or invalid email
-			if (!email || !email_regex.test(email)) {
-				$('#email').focus().closest('p').addClass('error');
-			} else {
-				$('[name=email]').val(email);
-				$('#magic_login_options .js_insert_email').text(email);
-				$('#signin_header, #signin_form, #magic_login_cta, .ssb_password').removeClass('hidden');
-				$('#magic_login_options, #signin_form_magic, #email, .browser_password').addClass('hidden');
-				$('#magic_login_use_password').focus();
-                        }
-
-                });
-
-		// user given magic login, but wants to enter email/password
-		$('#magic_login_use_password').on('click', function(e){
-
-			e.preventDefault();
-			$('.error').removeClass('error');
-			$('#magic_login_options').addClass('hidden');
-			$('#signin_form, #signin_header').removeClass('hidden');
-			$('#password').focus();
-
-		});
-
-		$('.code_problem').on('click', function (e) {
-			e.preventDefault();
-			$('.send_code_block').slideToggle();
-		});
-
-		$('.view_more_email_domains_button').on('click', function() {
-			var $team_email_domains = $('.team_email_domains');
-			$team_email_domains.text($team_email_domains.data('team-email-domains-formatted'));
-		});
-
-		$(document).ready(function() {
-			$forgot_pw = $('#forgot-pw');
-			if ($forgot_pw.length) {
-				/**
-				 * Grab the current email that the user has entered before going to the
-				 * 'forgot password' page so that we can prefill the email field.
-				 */
-				function grabEmail(e) {
-					var $el = $(e.target);
-					var new_url = $el.attr('href');
-					var email = $('#email').val();
-
-					/**
-					 * Simple check to make sure that the user actually typed in what looks like an email.
-					 * If what the user entered doesn't look like an email, don't prefill.
-					 */
-					if (email.length > 0 && email.indexOf('@') != -1) {
-						new_url += '?email=' + encodeURIComponent(email);
-					}
-
-					$el.attr('href', new_url);
-				}
-				$forgot_pw.on('click', grabEmail);
-			}
-		});
-
-		
-	</script>
-
-
-<style>.color_9f69e7:not(.nuc) {color:#9F69E7;}.color_4bbe2e:not(.nuc) {color:#4BBE2E;}.color_e7392d:not(.nuc) {color:#E7392D;}.color_3c989f:not(.nuc) {color:#3C989F;}.color_674b1b:not(.nuc) {color:#674B1B;}.color_e96699:not(.nuc) {color:#E96699;}.color_e0a729:not(.nuc) {color:#E0A729;}.color_684b6c:not(.nuc) {color:#684B6C;}.color_5b89d5:not(.nuc) {color:#5B89D5;}.color_2b6836:not(.nuc) {color:#2B6836;}.color_99a949:not(.nuc) {color:#99A949;}.color_df3dc0:not(.nuc) {color:#DF3DC0;}.color_4cc091:not(.nuc) {color:#4CC091;}.color_9b3b45:not(.nuc) {color:#9B3B45;}.color_d58247:not(.nuc) {color:#D58247;}.color_bb86b7:not(.nuc) {color:#BB86B7;}.color_5a4592:not(.nuc) {color:#5A4592;}.color_db3150:not(.nuc) {color:#DB3150;}.color_235e5b:not(.nuc) {color:#235E5B;}.color_9e3997:not(.nuc) {color:#9E3997;}.color_53b759:not(.nuc) {color:#53B759;}.color_c386df:not(.nuc) {color:#C386DF;}.color_385a86:not(.nuc) {color:#385A86;}.color_a63024:not(.nuc) {color:#A63024;}.color_5870dd:not(.nuc) {color:#5870DD;}.color_ea2977:not(.nuc) {color:#EA2977;}.color_50a0cf:not(.nuc) {color:#50A0CF;}.color_d55aef:not(.nuc) {color:#D55AEF;}.color_d1707d:not(.nuc) {color:#D1707D;}.color_43761b:not(.nuc) {color:#43761B;}.color_e06b56:not(.nuc) {color:#E06B56;}.color_8f4a2b:not(.nuc) {color:#8F4A2B;}.color_902d59:not(.nuc) {color:#902D59;}.color_de5f24:not(.nuc) {color:#DE5F24;}.color_a2a5dc:not(.nuc) {color:#A2A5DC;}.color_827327:not(.nuc) {color:#827327;}.color_3c8c69:not(.nuc) {color:#3C8C69;}.color_8d4b84:not(.nuc) {color:#8D4B84;}.color_84b22f:not(.nuc) {color:#84B22F;}.color_4ec0d6:not(.nuc) {color:#4EC0D6;}.color_e23f99:not(.nuc) {color:#E23F99;}.color_e475df:not(.nuc) {color:#E475DF;}.color_619a4f:not(.nuc) {color:#619A4F;}.color_a72f79:not(.nuc) {color:#A72F79;}.color_7d414c:not(.nuc) {color:#7D414C;}.color_aba727:not(.nuc) {color:#ABA727;}.color_965d1b:not(.nuc) {color:#965D1B;}.color_4d5e26:not(.nuc) {color:#4D5E26;}.color_dd8527:not(.nuc) {color:#DD8527;}.color_bd9336:not(.nuc) {color:#BD9336;}.color_e85d72:not(.nuc) {color:#E85D72;}.color_dc7dbb:not(.nuc) {color:#DC7DBB;}.color_bc3663:not(.nuc) {color:#BC3663;}.color_9d8eee:not(.nuc) {color:#9D8EEE;}.color_8469bc:not(.nuc) {color:#8469BC;}.color_73769d:not(.nuc) {color:#73769D;}.color_b14cbc:not(.nuc) {color:#B14CBC;}</style>
-
-<!-- slack-www-hhvm-003831af2a32a662c / 2018-03-24 11:30:50 / v994744788f157f504d4123016987a792d9ade09c / B:H -->
-
-
-</body>
-</html>
+def inference_resnext_v1(net, input_layer, nlayer):
+    """Aggregated  Residual Networks family of models
+    https://arxiv.org/abs/1611.05431
+    """
+    cardinality_to_bottleneck_width = { 1:64, 2:40, 4:24, 8:14, 32:4 }
+    net.cardinality = 32
+    net.shortcut_type = 'B'
+    assert net.cardinality in cardinality_to_bottleneck_width.keys(), \
+    "Invalid  cardinality (%i); must be one of: 1,2,4,8,32" % net.cardinality
+    net.bottleneck_width = cardinality_to_bottleneck_width[net.cardinality]  
+    if nlayer ==  50: return inference_resnext_v1_impl(net, input_layer, [3,4, 6,3])
+    elif nlayer == 101: return inference_resnext_v1_impl(net, input_layer, [3,4,23,3])
+    elif nlayer == 152: return inference_resnext_v1_impl(net, input_layer, [3,8,36,3])
+    else: raise ValueError("Invalid nlayer (%i); must be one of: 50,101,152" %
+                           nlayer)
+
+# Stem functions
+def inception_v4_sa(net, x):
+    cols = [[('pool', 'MAX', (3,3))],
+            [('conv',  96, (3,3), (2,2), 'VALID')]]
+    return net.inception_module(x, 'incept_v4_sa', cols)
+def inception_v4_sb(net, x):
+    cols = [[('conv',  64, (1,1)), ('conv',  96, (3,3), (1,1), 'VALID')],
+            [('conv',  64, (1,1)), ('conv',  64, (7,1)), ('conv',  64, (1,7)), ('conv',  96, (3,3), (1,1), 'VALID')]]
+    return net.inception_module(x, 'incept_v4_sb', cols)
+def inception_v4_sc(net, x):
+    cols = [[('conv', 192, (3,3), (2,2), 'VALID')],
+            [('pool', 'MAX', (3,3))]]
+    return net.inception_module(x, 'incept_v4_sc', cols)
+# Reduction functions
+def inception_v4_ra(net, x, k, l, m, n):
+    cols = [[('pool', 'MAX', (3,3))],
+            [('conv',   n, (3,3), (2,2), 'VALID')],
+            [('conv',   k, (1,1)), ('conv',   l, (3,3)), ('conv',   m, (3,3), (2,2), 'VALID')]]
+    return net.inception_module(x, 'incept_v4_ra', cols)
+def inception_v4_rb(net, x):
+    cols = [[('pool', 'MAX', (3,3))],
+            [('conv', 192, (1,1)), ('conv', 192, (3,3), (2,2), 'VALID')],
+            [('conv', 256, (1,1)), ('conv', 256, (1,7)), ('conv', 320, (7,1)), ('conv', 320, (3,3), (2,2), 'VALID')]]
+    return net.inception_module(x, 'incept_v4_rb', cols)
+def inception_resnet_v2_rb(net, x):
+    cols = [[('pool', 'MAX', (3,3))],
+            # Note: These match Facebook's Torch implem
+            [('conv', 256, (1,1)), ('conv', 384, (3,3), (2,2), 'VALID')],
+            [('conv', 256, (1,1)), ('conv', 256, (3,3), (2,2), 'VALID')],
+            [('conv', 256, (1,1)), ('conv', 256, (3,3)), ('conv', 256, (3,3), (2,2), 'VALID')]]
+    return net.inception_module(x, 'incept_resnet_v2_rb', cols)
+
+def inference_inception_v4(net, input_layer):
+    """Google's Inception v4 model
+    https://arxiv.org/abs/1602.07261
+    """
+    def inception_v4_a(net, x):
+        cols = [[('pool', 'AVG', (3,3), (1,1), 'SAME'), ('conv',  96, (1,1))],
+                [('conv',  96, (1,1))],
+                [('conv',  64, (1,1)), ('conv',  96, (3,3))],
+                [('conv',  64, (1,1)), ('conv',  96, (3,3)), ('conv',  96, (3,3))]]
+        return net.inception_module(x, 'incept_v4_a', cols)
+    def inception_v4_b(net, x):
+        cols = [[('pool', 'AVG', (3,3), (1,1), 'SAME'), ('conv', 128, (1,1))],
+                [('conv', 384, (1,1))],
+                [('conv', 192, (1,1)), ('conv', 224, (1,7)), ('conv', 256, (7,1))],
+                [('conv', 192, (1,1)), ('conv', 192, (1,7)), ('conv', 224, (7,1)), ('conv', 224, (1,7)), ('conv', 256, (7,1))]]
+        return net.inception_module(x, 'incept_v4_b', cols)
+    def inception_v4_c(net, x):
+        cols = [[('pool', 'AVG', (3,3), (1,1), 'SAME'), ('conv', 256, (1,1))],
+                [('conv', 256, (1,1))],
+                [('conv', 384, (1,1)), ('conv', 256, (1,3))],
+                [('share',),           ('conv', 256, (3,1))],
+                [('conv', 384, (1,1)), ('conv', 448, (1,3)), ('conv', 512, (3,1)), ('conv', 256, (3,1))],
+                [('share',),           ('share',),           ('share',),           ('conv', 256, (1,3))]]
+        return net.inception_module(x, 'incept_v4_c', cols)
+
+    net.use_batch_norm = True
+    x = net.input_layer(input_layer)
+    x = net.conv(x, 32, (3,3), (2,2), padding='VALID')
+    x = net.conv(x, 32, (3,3), (1,1), padding='VALID')
+    x = net.conv(x, 64, (3,3))
+    x = inception_v4_sa(net, x)
+    x = inception_v4_sb(net, x)
+    x = inception_v4_sc(net, x)
+    for _ in range(4):
+        x = inception_v4_a(net, x)
+    x = inception_v4_ra(net, x, 192, 224, 256, 384)
+    for _ in range(7):
+        x = inception_v4_b(net, x)
+    x = inception_v4_rb(net, x)
+    for _ in range(3):
+        x = inception_v4_c(net, x)
+    x = net.spatial_avg(x)
+    x = net.dropout(x, 0.8)
+    return x
+
+def inference_inception_resnet_v2(net, input_layer):
+    """Google's Inception-Resnet v2 model
+    https://arxiv.org/abs/1602.07261
+    """
+    def inception_resnet_v2_a(net, x):
+        cols = [[('conv',  32, (1,1))],
+                [('conv',  32, (1,1)), ('conv',  32, (3,3))],
+                [('conv',  32, (1,1)), ('conv',  48, (3,3)), ('conv',  64, (3,3))]]
+        x = net.inception_module(x, 'incept_resnet_v2_a', cols)
+        x = net.conv(x, 384, (1,1), activation='LINEAR')
+        return x
+    def inception_resnet_v2_b(net, x):
+        cols = [[('conv', 192, (1,1))],
+                [('conv', 128, (1,1)), ('conv', 160, (1,7)), ('conv', 192, (7,1))]]
+        x = net.inception_module(x, 'incept_resnet_v2_b', cols)
+        x = net.conv(x, 1152, (1,1), activation='LINEAR')
+        return x
+    def inception_resnet_v2_c(net, x):
+        cols = [[('conv', 192, (1,1))],
+                [('conv', 192, (1,1)), ('conv', 224, (1,3)), ('conv', 256, (3,1))]]
+        x = net.inception_module(x, 'incept_resnet_v2_c', cols)
+        x = net.conv(x, 2048, (1,1), activation='LINEAR')
+        return x
+
+    net.use_batch_norm = True
+    residual_scale = 0.2
+    x = net.input_layer(input_layer)
+    x = net.conv(x, 32, (3,3), (2,2), padding='VALID')
+    x = net.conv(x, 32, (3,3), (1,1), padding='VALID')
+    x = net.conv(x, 64, (3,3))
+    x = inception_v4_sa(net, x)
+    x = inception_v4_sb(net, x)
+    x = inception_v4_sc(net, x)
+    for _ in range(5):
+        x = net.residual(x, inception_resnet_v2_a, scale=residual_scale)
+    x = inception_v4_ra(net, x, 256, 256, 384, 384)
+    for _ in range(10):
+        x = net.residual(x, inception_resnet_v2_b, scale=residual_scale)
+    x = inception_resnet_v2_rb(net, x)
+    for _ in range(5):
+        x = net.residual(x, inception_resnet_v2_c, scale=residual_scale)
+    x = net.spatial_avg(x)
+    x = net.dropout(x, 0.8)
+    return x
+
+def run_evaluation(nstep, sess, top1_op, top5_op, enqueue_ops):
+    print("Evaluating")
+    top1s = []
+    top5s = []
+    print("  Step  Top-1  Top-5")
+    for step in range(nstep):
+        try:
+            top1, top5 = sess.run([top1_op, top5_op, enqueue_ops])[:2]
+            if step == 0 or (step+1) % FLAGS.display_every == 0:
+                print("% 6i %5.1f%% %5.1f%%" % (step+1, top1*100, top5*100))
+            top1s.append(top1)
+            top5s.append(top5)
+        except KeyboardInterrupt:
+            print("Keyboard interrupt")
+            break
+    nstep = len(top1s)
+    if nstep == 0:
+        return
+    top1s = np.asarray(top1s) * 100.
+    top5s = np.asarray(top5s) * 100.
+    top1_mean = np.mean(top1s)
+    top5_mean = np.mean(top5s)
+    if nstep > 2:
+        top1_uncertainty = np.std(top1s, ddof=1) / np.sqrt(float(nstep))
+        top5_uncertainty = np.std(top5s, ddof=1) / np.sqrt(float(nstep))
+    else:
+        top1_uncertainty = float('nan')
+        top5_uncertainty = float('nan')
+    top1_madstd = 1.4826*np.median(np.abs(top1s - np.median(top1s)))
+    top5_madstd = 1.4826*np.median(np.abs(top5s - np.median(top5s)))
+    print('-' * 64)
+    print('Validation Top-1: %.3f %% +/- %.2f (jitter = %.1f)' % (
+        top1_mean, top1_uncertainty, top1_madstd))
+    print('Validation Top-5: %.3f %% +/- %.2f (jitter = %.1f)' % (
+        top5_mean, top5_uncertainty, top5_madstd))
+    print('-' * 64)
+
+def get_num_records(tf_record_pattern):
+    def count_records(tf_record_filename):
+        count = 0
+        for _ in tf.python_io.tf_record_iterator(tf_record_filename):
+            count += 1
+        return count
+    filenames = sorted(tf.gfile.Glob(tf_record_pattern))
+    nfile = len(filenames)
+    return (count_records(filenames[0])*(nfile-1) +
+            count_records(filenames[-1]))
+
+def add_bool_argument(cmdline, shortname, longname=None, default=False, help=None):
+    if longname is None:
+        shortname, longname = None, shortname
+    elif default == True:
+        raise ValueError("""Boolean arguments that are True by default should not have short names.""")
+    name = longname[2:]
+    feature_parser = cmdline.add_mutually_exclusive_group(required=False)
+    if shortname is not None:
+        feature_parser.add_argument(shortname, '--'+name, dest=name, action='store_true', help=help, default=default)
+    else:
+        feature_parser.add_argument(           '--'+name, dest=name, action='store_true', help=help, default=default)
+    feature_parser.add_argument('--no'+name, dest=name, action='store_false')
+    return cmdline
+
+def main():
+    tf.set_random_seed(1234+hvd.rank())
+    np.random.seed(4321+hvd.rank())
+    cmdline = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    # Basic options
+    cmdline.add_argument('-m', '--model', required=True,
+                         help="""Name of model to run:
+                         trivial, lenet,
+                         alexnet, googlenet, vgg[11,13,16,19],
+                         inception[3,4], resnet[18,34,50,101,152],
+                         resnext[50,101,152], inception-resnet2.""")
+    cmdline.add_argument('--data_dir', default=None,
+                         help="""Path to dataset in TFRecord format
+                         (aka Example protobufs). Files should be
+                         named 'train-*' and 'validation-*'.""")
+    cmdline.add_argument('-b', '--batch_size', default=64, type=int,
+                         help="""Size of each minibatch.""")
+    cmdline.add_argument('--num_batches', default=50, type=int,
+                         help="""Number of batches to run.
+                         Ignored during eval.""")
+    cmdline.add_argument('--num_epochs', default=None, type=int,
+                         help="""Number of epochs to run.
+                         Overrides --num_batches. Ignored during eval.""")
+    cmdline.add_argument('--log_dir', default="",
+                         help="""Directory in which to write training
+                         summaries and checkpoints.""")
+    cmdline.add_argument('--display_every', default=1, type=int,
+                         help="""How often (in iterations) to print out
+                         running information.""")
+    cmdline.add_argument('--save_interval', default=43200, type=int,
+                         help="""Time in seconds between checkpoints.""")
+    cmdline.add_argument('--summary_interval', default=3600, type=int,
+                         help="""Time in seconds between saves of summary statistics.""")
+    add_bool_argument(cmdline, '--eval',
+                      help="""Evaluate the top-1 and top-5 accuracy of
+                      a checkpointed model.""")
+    add_bool_argument(cmdline, '--fp16',
+                      help="""Train using float16 (half) precision instead
+                      of float32.""")
+
+    global FLAGS
+    FLAGS, unknown_args = cmdline.parse_known_args()
+    if len(unknown_args) > 0:
+        for bad_arg in unknown_args:
+            print("ERROR: Unknown command line arg: %s" % bad_arg)
+        raise ValueError("Invalid command line arg(s)")
+
+    nclass = 1000
+    batch_size = FLAGS.batch_size
+    subset = 'validation' if FLAGS.eval else 'train'
+
+    tfversion = tensorflow_version_tuple()
+    print_r0("TensorFlow:  %i.%i.%s" % tfversion)
+    print_r0("This script:", __file__, "v%s" % __version__)
+    print_r0("Cmd line args:")
+    print_r0('\n'.join(['  '+arg for arg in sys.argv[1:]]))
+
+    if FLAGS.data_dir is not None and FLAGS.data_dir != '':
+        nrecord = get_num_records(os.path.join(FLAGS.data_dir, '%s-*' % subset))
+    else:
+        nrecord = FLAGS.num_batches * batch_size * hvd.size()
+
+    # Training hyperparameters
+    FLAGS.learning_rate         = 0.001 # Model-specific values are set below
+    FLAGS.momentum              = 0.9
+    FLAGS.lr_decay_policy       = 'poly'
+    FLAGS.lr_decay_epochs       = 30
+    FLAGS.lr_decay_rate         = 0.1
+    FLAGS.lr_poly_power         = 2.
+    FLAGS.weight_decay          = 1e-4
+    FLAGS.input_buffer_size     = min(10000, nrecord)
+    FLAGS.distort_color         = False
+    FLAGS.nstep_burnin          = 20
+    FLAGS.loss_scale            = 10. # TODO: May need to decide this based on model
+    FLAGS.LARC_eta              = 0.003
+    FLAGS.LARC_epsilon          = 1.
+    FLAGS.LARC_mode             = 'clip'
+
+    model_dtype = tf.float16 if FLAGS.fp16 else tf.float32
+
+    print_r0("Num ranks:  ", hvd.size())
+    print_r0("Num images: ", nrecord if FLAGS.data_dir is not None else 'Synthetic')
+    print_r0("Model:      ", FLAGS.model)
+    print_r0("Batch size: ", batch_size, 'per device')
+    print_r0("            ", batch_size * hvd.size(), 'total')
+    print_r0("Data format:", 'NCHW')
+    print_r0("Data type:  ", 'fp16' if model_dtype == tf.float16 else 'fp32')
+
+    if FLAGS.num_epochs is not None:
+        if FLAGS.data_dir is None:
+            raise ValueError("num_epochs requires data_dir to be specified")
+        nstep = nrecord * FLAGS.num_epochs // (batch_size * hvd.size())
+    else:
+        nstep = FLAGS.num_batches
+        FLAGS.num_epochs = max(nstep * batch_size * hvd.size() // nrecord, 1)
+
+    model_name = FLAGS.model
+    if   model_name == 'trivial':
+        height, width = 224, 224
+        model_func = inference_trivial
+    elif model_name == 'lenet':
+        height, width = 28, 28
+        model_func = inference_lenet5
+    elif model_name == 'alexnet':
+        height, width = 227, 227
+        model_func = inference_alexnet_owt
+        FLAGS.learning_rate = 0.03
+    elif model_name == 'overfeat':
+        height, width = 231, 231
+        model_func = inference_overfeat
+    elif model_name.startswith('vgg'):
+        height, width = 224, 224
+        nlayer = int(model_name[len('vgg'):])
+        model_func = lambda net, images: inference_vgg(net, images, nlayer)
+        FLAGS.learning_rate = 0.02
+    elif model_name == 'googlenet':
+        height, width = 224, 224
+        model_func = inference_googlenet
+        FLAGS.learning_rate = 0.04
+    elif model_name == 'inception3':
+        height, width = 299, 299
+        model_func = inference_inception_v3
+        FLAGS.learning_rate = 0.2
+    elif model_name.startswith('resnet'):
+        height, width = 224, 224
+        nlayer = int(model_name[len('resnet'):])
+        model_func = lambda net, images: inference_resnet_v1(net, images, nlayer)
+        FLAGS.learning_rate = 1. * (batch_size * hvd.size() / 1024.0) if nlayer > 18 else 0.5
+    elif model_name.startswith('resnext'):
+        height, width = 224, 224
+        nlayer = int(model_name[len('resnext'):])
+        model_func = lambda net, images: inference_resnext_v1(net, images, nlayer)
+        FLAGS.learning_rate = 0.1
+    elif model_name == 'inception4':
+        height, width = 299, 299
+        model_func = inference_inception_v4
+        FLAGS.learning_rate = 0.045
+    elif model_name == 'inception-resnet2':
+        height, width = 299, 299
+        model_func = inference_inception_resnet_v2
+        FLAGS.learning_rate = 0.045
+    else:
+        raise ValueError("Invalid model type: %s" % model_name)
+
+    if FLAGS.data_dir is None:
+        preprocessor = DummyPreprocessor(height, width, batch_size, nclass)
+    else:
+        preprocessor = ImagePreprocessor(height, width, subset)
+
+    def loss_func(images, labels, var_scope):
+        # Build the forward model
+        net = GPUNetworkBuilder(True, dtype=model_dtype)
+        output = model_func(net, images)
+        # Add final FC layer to produce nclass outputs
+        logits = net.fully_connected(output, nclass, activation='LINEAR')
+        if logits.dtype != tf.float32:
+            logits = tf.cast(logits, tf.float32)
+        loss = tf.losses.sparse_softmax_cross_entropy(
+            logits=logits, labels=labels)
+        # Add weight decay
+        if FLAGS.weight_decay is not None and FLAGS.weight_decay != 0.:
+            params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,
+                                       scope=var_scope.name)
+            l2_loss = tf.add_n([tf.nn.l2_loss(w) for w in params])
+            if l2_loss.dtype != tf.float32:
+                l2_loss = tf.cast(l2_loss, tf.float32)
+            loss += FLAGS.weight_decay * l2_loss
+        return loss, logits
+    def eval_func(images, labels, var_scope):
+        net = GPUNetworkBuilder(False, dtype=model_dtype)
+        output = model_func(net, images)
+        logits = net.fully_connected(output, nclass, activation='LINEAR')
+        if logits.dtype != tf.float32:
+            logits = tf.cast(logits, tf.float32)
+        with tf.device('/cpu:0'):
+            top1 = tf.reduce_mean(
+                tf.cast(tf.nn.in_top_k(logits, labels, 1), tf.float32))
+            top5 = tf.reduce_mean(
+                tf.cast(tf.nn.in_top_k(logits, labels, 5), tf.float32))
+        return top1, top5
+
+    if FLAGS.eval:
+        if FLAGS.data_dir is None:
+            raise ValueError("eval requires data_dir to be specified")
+        if FLAGS.fp16:
+            raise ValueError("eval cannot be run with in fp16")
+        if hvd.size() > 1:
+            raise ValueError("Multi-GPU evaluation is not supported")
+        evaluator = FeedForwardEvaluator(preprocessor, eval_func)
+        print("Building evaluation graph")
+        top1_op, top5_op, enqueue_ops = evaluator.evaluation_step(batch_size)
+    else:
+        nstep_per_epoch = nrecord // (batch_size * hvd.size())
+        trainer = FeedForwardTrainer(preprocessor, loss_func, nstep_per_epoch)
+        print_r0("Building training graph")
+        total_loss, learning_rate, train_ops = trainer.training_step(
+            batch_size)
+
+    print_r0("Creating session")
+    config = tf.ConfigProto()
+    config.intra_op_parallelism_threads = 1
+    config.inter_op_parallelism_threads = 10
+    config.gpu_options.force_gpu_compatible = True
+    config.gpu_options.visible_device_list = str(hvd.local_rank())
+
+    sess = tf.Session(config=config)
+
+    train_writer = None
+    saver = None
+    summary_ops = None
+    if hvd.rank() == 0 and len(FLAGS.log_dir):
+        log_dir = FLAGS.log_dir
+        train_writer = tf.summary.FileWriter(log_dir, sess.graph)
+        summary_ops = tf.summary.merge_all()
+        last_summary_time = time.time()
+        saver = tf.train.Saver(keep_checkpoint_every_n_hours=3)
+        last_save_time = time.time()
+
+    if not FLAGS.eval:
+        print_r0("Initializing variables")
+        trainer.init(sess)
+
+    restored = False
+    if hvd.rank() == 0 and saver is not None:
+        ckpt = tf.train.get_checkpoint_state(log_dir)
+        checkpoint_file = os.path.join(log_dir, "checkpoint")
+        if ckpt and ckpt.model_checkpoint_path:
+            saver.restore(sess, ckpt.model_checkpoint_path)
+            restored = True
+            print("Restored session from checkpoint " + ckpt.model_checkpoint_path)
+        else:
+            if not os.path.exists(log_dir):
+                os.mkdir(log_dir)
+
+    if FLAGS.eval:
+        if not restored:
+            raise ValueError("No checkpoint found for evaluation")
+        else:
+            print("Pre-filling input pipeline")
+            evaluator.prefill_pipeline(sess)
+            nstep = nrecord // batch_size
+            run_evaluation(nstep, sess, top1_op, top5_op, enqueue_ops)
+            return
+
+    trainer.sync(sess)
+
+    if hvd.rank() == 0 and not restored:
+        if saver is not None:
+            save_path = saver.save(sess, checkpoint_file, global_step=0)
+            print("Checkpoint written to", save_path)
+
+    print_r0("Pre-filling input pipeline")
+    trainer.prefill_pipeline(sess)
+
+    print_r0("Training")
+    print_r0("  Step Epoch Img/sec   Loss   LR")
+    batch_times = []
+    oom = False
+    step0 = int(sess.run(trainer.global_step))
+    for step in range(step0, nstep):
+        ops_to_run = [total_loss, learning_rate] + train_ops
+        try:
+            start_time = time.time()
+            if (hvd.rank() == 0 and summary_ops is not None and
+                (step == 0 or step+1 == nstep or
+                 time.time() - last_summary_time > FLAGS.summary_interval)):
+                if step != 0:
+                    last_summary_time += FLAGS.summary_interval
+                print("Writing summaries to ", log_dir)
+                summary, loss, lr = sess.run([summary_ops] + ops_to_run)[:3]
+                train_writer.add_summary(summary, step)
+            else:
+                loss, lr = sess.run(ops_to_run)[:2]
+            elapsed = time.time() - start_time
+        except KeyboardInterrupt:
+            print("Keyboard interrupt")
+            break
+        except tf.errors.ResourceExhaustedError:
+            elapsed = -1.
+            loss    = 0.
+            lr      = -1
+            oom = True
+
+        if (hvd.rank() == 0 and saver is not None and
+            (time.time() - last_save_time > FLAGS.save_interval or step+1 == nstep)):
+            last_save_time += FLAGS.save_interval
+            save_path = saver.save(sess, checkpoint_file,
+                                   global_step=trainer.global_step)
+            print("Checkpoint written to", save_path)
+
+        if step >= FLAGS.nstep_burnin:
+            batch_times.append(elapsed)
+        img_per_sec = batch_size / elapsed
+        effective_accuracy = 100. / math.exp(min(loss,20.))
+        if step == 0 or (step+1) % FLAGS.display_every == 0:
+            epoch = step*batch_size*hvd.size() // nrecord
+            print_r0("%6i %5i %7.1f %7.3f %7.5f" % (
+                step+1, epoch+1, img_per_sec*hvd.size(), loss, lr))
+        if oom:
+            break
+    nstep = len(batch_times)
+    if nstep > 0:
+        batch_times = np.array(batch_times)
+        speeds = batch_size*hvd.size() / batch_times
+        speed_mean = np.mean(speeds)
+        if nstep > 2:
+            speed_uncertainty = np.std(speeds, ddof=1) / np.sqrt(float(nstep))
+        else:
+            speed_uncertainty = float('nan')
+        speed_madstd = 1.4826*np.median(np.abs(speeds - np.median(speeds)))
+        speed_jitter = speed_madstd
+        print_r0('-' * 64)
+        print_r0('Images/sec: %.1f +/- %.1f (jitter = %.1f)' % (
+            speed_mean, speed_uncertainty, speed_jitter))
+        print_r0('-' * 64)
+    else:
+        print_r0("No results, did not get past burn-in phase (%i steps)" %
+              FLAGS.nstep_burnin)
+
+    if train_writer is not None:
+        train_writer.close()
+
+    if oom:
+        print("Out of memory error detected, exiting")
+        sys.exit(-2)
+
+if __name__ == '__main__':
+    main()
