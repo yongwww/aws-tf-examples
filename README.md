@@ -6,8 +6,10 @@
 4. Resize to 480px shortest size using script *tensorflow_image_resizer.py*
 
 ```
-python tensorflow_image_resizer.py -i /path/to/imagenet-full-tfrecord/ -o /path/to/imagenet-new-tfrecord/ --subset_name train
-python tensorflow_image_resizer.py -i /path/to/imagenet-full-tfrecord/ -o /path/to/imagenet-new-tfrecord/ --subset_name validation
+python tensorflow_image_resizer.py -d imagenet -i /path/to/imagenet-full-tfrecord/ -o /path/to/imagenet-new-tfrecord/ \
+       --subset_name train --num_preprocess_threads 60 --num_intra_threads 2 --num_inter_threads 2
+python tensorflow_image_resizer.py -d imagenet -i /path/to/imagenet-full-tfrecord/ -o /path/to/imagenet-new-tfrecord/ \
+       --subset_name validation --num_preprocess_threads 60 --num_intra_threads 2 --num_inter_threads 2
 ```
 
 
@@ -15,26 +17,26 @@ python tensorflow_image_resizer.py -i /path/to/imagenet-full-tfrecord/ -o /path/
 
 ```
 python ./cnn/nvcnn.py
- --num_epochs=90
- --batch_size=256
- --display_every 100
- --data_dir=[PATH TO TFRECORD DATASET]
- --log_dir=[PATH TO CHECKPOINT DIR]
- -m resnet50
- --num_gpus=8
- --fp16
+      --num_epochs=90 \
+      --batch_size=256 \
+      --display_every 100 \
+      --data_dir=[PATH TO TFRECORD DATASET] \
+      --log_dir=[PATH TO CHECKPOINT DIR] \
+      -m resnet50 \
+      --num_gpus=8 \
+      --fp16
 ```
 
 ### Evaluate (Top-1 and Top-5 validation accuracy)
 ```
 python ./cnn/nvcnn.py
- --num_epochs=90
- --batch_size=256
- --display_every 100
- --data_dir=[PATH TO TFRECORD DATASET]
- --log_dir=[PATH TO CHECKPOINT DIR]
- -m resnet50
- --num_gpus=8
- --fp16
- --eval
+      --num_epochs=90 \
+      --batch_size=256 \
+      --display_every 100 \
+      --data_dir=[PATH TO TFRECORD DATASET] \
+      --log_dir=[PATH TO CHECKPOINT DIR] \
+      -m resnet50 \
+      --num_gpus=8 \
+      --fp16 \
+      --eval
 ```

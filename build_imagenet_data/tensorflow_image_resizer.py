@@ -222,6 +222,10 @@ if __name__ == "__main__":
     num_examples = dataset.num_examples_per_epoch(FLAGS.subset_name)
     examples_per_shard = (num_examples-1) // num_shards + 1
 
+    print(" num_preprocess_threads : {}\n examples_per_shard is {}\n "
+          "num_intra_threads is {}\n num_inter_threads is {}".format(FLAGS.num_preprocess_threads, examples_per_shard,
+                                                                     FLAGS.num_inter_threads, FLAGS.num_intra_threads))
+
     config = tf.ConfigProto(
         inter_op_parallelism_threads = FLAGS.num_inter_threads,
         intra_op_parallelism_threads = FLAGS.num_intra_threads)
@@ -231,7 +235,7 @@ if __name__ == "__main__":
     filename_queue = tf.train.string_input_producer(
         string_tensor = infiles,
         shuffle = False,
-        capacity = 16,#examples_per_shard * FLAGS.num_intra_threads,
+        capacity = examples_per_shard * FLAGS.num_preprocess_threads,
         shared_name = 'filename_queue',
         name = 'filename_queue',
         num_epochs = 1)

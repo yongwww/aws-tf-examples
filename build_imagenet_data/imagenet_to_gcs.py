@@ -13,14 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
-r"""Script to download the Imagenet dataset and upload to gcs.
-
-To run the script setup a virtualenv with the following libraries installed.
-- `gcloud`: Follow the instructions on
-  [cloud SDK docs](https://cloud.google.com/sdk/downloads) followed by
-  installing the python api using `pip install gcloud`.
-- `google-cloud-storage`: Install with `pip install google-cloud-storage`
-- `tensorflow`: Install with `pip install tensorflow`
+r"""Script to download the Imagenet dataset
 
 Once you have all the above libraries setup, you should register on the
 [Imagenet website](http://image-net.org/download-images) to get your
@@ -30,8 +23,6 @@ Make sure you have around 300GB of disc space available on the machine where
 you're running this script. You can run the script using the following command.
 ```
 python imagenet_to_gcs.py \
-  --project="TEST_PROJECT" \
-  --gcs_output_path="gs://TEST_BUCKET/IMAGENET_DIR" \
   --local_scratch_dir="./imagenet" \
   --imagenet_username=FILL_ME_IN \
   --imagenet_access_key=FILL_ME_IN \
@@ -54,12 +45,6 @@ import urllib
 from absl import flags
 import tensorflow as tf
 
-#from google.cloud import storage
-
-flags.DEFINE_string(
-    'project', None, 'Google cloud project id for uploading the dataset.')
-flags.DEFINE_string(
-    'gcs_output_path', None, 'GCS path for uploading the dataset.')
 flags.DEFINE_string(
     'local_scratch_dir', None, 'Scratch directory path for temporary files.')
 flags.DEFINE_string(
@@ -131,20 +116,20 @@ def download_dataset(raw_data_dir):
     subdirectory = os.path.join(directory, member.name.split('.')[0])
     sub_tarfile = os.path.join(subdirectory, member.name)
 
-    _untar_file(filename, subdirectory, member)
-    _untar_file(sub_tarfile, subdirectory)
-    os.remove(sub_tarfile)
+    #_untar_file(filename, subdirectory, member)
+    #_untar_file(sub_tarfile, subdirectory)
+    #os.remove(sub_tarfile)
 
   # Download synset_labels for validation set
   tf.logging.info('Downloading the validation labels.')
-  _download(LABELS_URL, os.path.join(raw_data_dir, LABELS_FILE))
+  #_download(LABELS_URL, os.path.join(raw_data_dir, LABELS_FILE))
 
   # Download the validation data
   tf.logging.info('Downloading the validation set. This may take a few hours.')
   directory = os.path.join(raw_data_dir, VALIDATION_DIRECTORY)
   filename = os.path.join(raw_data_dir, VALIDATION_FILE)
   #_download(BASE_URL + VALIDATION_FILE, filename)
-  _untar_file(filename, directory)
+  #_untar_file(filename, directory)
 
 
 def _int64_feature(value):
@@ -179,13 +164,13 @@ def _convert_to_example(filename, image_buffer, label, synset, height, width):
   example = tf.train.Example(features=tf.train.Features(feature={
       'image/height': _int64_feature(height),
       'image/width': _int64_feature(width),
-      'image/colorspace': _bytes_feature(colorspace),
+      'image/colorspace': _bytes_feature(tf.compat.as_bytes(colorspace)),
       'image/channels': _int64_feature(channels),
       'image/class/label': _int64_feature(label),
-      'image/class/synset': _bytes_feature(synset),
-      'image/format': _bytes_feature(image_format),
-      'image/filename': _bytes_feature(os.path.basename(filename)),
-      'image/encoded': _bytes_feature(image_buffer)}))
+      'image/class/synset': _bytes_feature(tf.compat.as_bytes(synset)),
+      'image/format': _bytes_feature(tf.compat.as_bytes(image_format)),
+      'image/filename': _bytes_feature(tf.compat.as_bytes(os.path.basename(filename))),
+      'image/encoded': _bytes_feature(tf.compat.as_bytes(image_buffer))}))
   return example
 
 
@@ -249,9 +234,26 @@ class ImageCoder(object):
     self._decode_jpeg_data = tf.placeholder(dtype=tf.string)
     self._decode_jpeg = tf.image.decode_jpeg(self._decode_jpeg_data, channels=3)
 
+    # Resize image to 480px sort side, keep aspect ratio
+    self._resize_image = tf.placeholder(dtype=tf.string)
+    #self._size = tf.placeholder(dtype=tf.string)
+    self._resize_height = tf.placeholder(dtype=tf.int32)
+    self._resize_width = tf.placeholder(dtype=tf.int32)
+    image = tf.image.decode_jpeg(self._resize_image, channels = 3)
+    self._resize_480 = tf.image.resize_images(images = image,
+                                              size = [self._resize_height, self._resize_width],
+                                              method = tf.image.ResizeMethod.BILINEAR,
+                                              align_corners = False)
+
   def png_to_jpeg(self, image_data):
     return self._sess.run(self._png_to_jpeg,
                           feed_dict={self._png_data: image_data})
+
+  def resize_480(self, image_data, height, width):
+    return self._sess.run(self._resize_480,
+                          feed_dict={self._resize_image: image_data,
+                                     self._resize_height: height,
+                                     self._resize_width: width})
 
   def cmyk_to_rgb(self, image_data):
     return self._sess.run(self._cmyk_to_rgb,
@@ -277,7 +279,7 @@ def _process_image(filename, coder):
     width: integer, image width in pixels.
   """
   # Read the image file.
-  with tf.gfile.FastGFile(filename, 'r') as f:
+  with tf.gfile.FastGFile(filename, 'rb') as f:
     image_data = f.read()
 
   # Clean the dirty data.
@@ -292,11 +294,30 @@ def _process_image(filename, coder):
 
   # Decode the RGB JPEG.
   image = coder.decode_jpeg(image_data)
+  height = image.shape[0]
+  width = image.shape[1]
+
+  # resize the image to shortest side 480 and keep aspect ratio
+  #min_side = min(height, width)
+  #scale = min(float(480) / float(min_side), 1.0)
+  #height = int(scale * height)
+  #width = int(scale * width)
+  #image_data = tf.image.resize_images(image, [height, width])
+  #resized_float = coder.resize_480(image_data, height, width)
+
+  #resized_uint8 = tf.cast(resized_float, tf.uint8)
+  #encoded_resized = tf.image.encode_jpeg(
+  #    resized_uint8,
+  #    format='rgb',
+  #    quality=100,
+  #    progressive=False,
+  #    optimize_size=True,
+  #    chroma_downsampling=True,
+  #    density_unit='in')
+  #image_data = coder.png_to_jpeg(encoded_resized)
 
   # Check that image converted to RGB
   assert len(image.shape) == 3
-  height = image.shape[0]
-  width = image.shape[1]
   assert image.shape[2] == 3
 
   return image_data, height, width
@@ -364,7 +385,7 @@ def convert_to_tf_records(raw_data_dir):
   # across the batches.
   random.seed(0)
   def make_shuffle_idx(n):
-    order = range(n)
+    order = list(range(n))
     random.shuffle(order)
     return order
 
@@ -409,49 +430,8 @@ def convert_to_tf_records(raw_data_dir):
   return training_records, validation_records
 
 
-def upload_to_gcs(training_records, validation_records):
-  """Upload TF-Record files to GCS, at provided path."""
-
-  # Find the GCS bucket_name and key_prefix for dataset files
-  path_parts = FLAGS.gcs_output_path[5:].split('/', 1)
-  bucket_name = path_parts[0]
-  if len(path_parts) == 1:
-    key_prefix = ''
-  elif path_parts[1].endswith('/'):
-    key_prefix = path_parts[1]
-  else:
-    key_prefix = path_parts[1] + '/'
-
-  client = storage.Client(project=FLAGS.project)
-  bucket = client.get_bucket(bucket_name)
-
-  def _upload_files(filenames):
-    """Upload a list of files into a specifc subdirectory."""
-    for i, filename in enumerate(sorted(filenames)):
-      blob = bucket.blob(key_prefix + os.path.basename(filename))
-      blob.upload_from_filename(filename)
-      if not i % 20:
-        tf.logging.info('Finished uploading file: %s' % filename)
-
-  # Upload training dataset
-  tf.logging.info('Uploading the training data.')
-  _upload_files(training_records)
-
-  # Upload validation dataset
-  tf.logging.info('Uploading the validation data.')
-  _upload_files(validation_records)
-
-
 def main(argv):  # pylint: disable=unused-argument
   tf.logging.set_verbosity(tf.logging.INFO)
-
-  if FLAGS.project is None:
-    pass#raise ValueError('GCS Project must be provided.')
-
-  if FLAGS.gcs_output_path is None:
-    pass#raise ValueError('GCS output path must be provided.')
-  elif not FLAGS.gcs_output_path.startswith('gs://'):
-    raise ValueError('GCS output path must start with gs://')
 
   if FLAGS.local_scratch_dir is None:
     pass#raise ValueError('Scratch directory path must be provided.')
@@ -465,9 +445,6 @@ def main(argv):  # pylint: disable=unused-argument
 
   # Convert the raw data into tf-records
   training_records, validation_records = convert_to_tf_records(raw_data_dir)
-
-  # Upload to GCS
-  upload_to_gcs(training_records, validation_records)
 
 
 if __name__ == '__main__':
