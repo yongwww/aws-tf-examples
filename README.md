@@ -1,15 +1,31 @@
 # aws-tf-examples
 ### Prepare tfrecords ImageNet dataset
-1. Create ImageNet account via official website [http://image-net.org](http://image-net.org).
-2. Download and uncompress ImageNet dataset by executing *./build_imagenet_data/download-imagenet.sh*
-3. Run *generate_tfrecord_protos.sh* to generate TenforFlow format dataset, do not select to resize
-4. Resize to 480px shortest size using script *tensorflow_image_resizer.py*
+In order to download imagenet dataset, you should create an ImageNet account via [http://image-net.org](http://image-net.org). Then you will have your account and access key.
+
+1. Download and untar imagenet dataset, generate TFRecords format dataset without changing the image size <br>
+```
+   python preprocess-imagenet.py \
+        --local_scratch_dir=[YOUR DIRECTORY] \
+        --imagenet_username=[imagenet account \
+        --imagenet_access_key=[imagenet access key]
+```
+2. Resize to 480px shortest size using script *tensorflow_image_resizer.py*
 
 ```
-python tensorflow_image_resizer.py -d imagenet -i /path/to/imagenet-full-tfrecord/ -o /path/to/imagenet-new-tfrecord/ \
-       --subset_name train --num_preprocess_threads 60 --num_intra_threads 2 --num_inter_threads 2
-python tensorflow_image_resizer.py -d imagenet -i /path/to/imagenet-full-tfrecord/ -o /path/to/imagenet-new-tfrecord/ \
-       --subset_name validation --num_preprocess_threads 60 --num_intra_threads 2 --num_inter_threads 2
+  python tensorflow_image_resizer.py -d imagenet \
+       -i [PATH TO TFRECORD TRAINING DATASET] \
+       -o  [PATH TO RESIZED TFRECORD TRAINING DATASET] \
+       --subset_name train \
+       --num_preprocess_threads 60 \
+       --num_intra_threads 2 \
+       --num_inter_threads 2
+  python tensorflow_image_resizer.py -d imagenet \
+       -i [PATH TO TFRECORD VALIDATION DATASET] \
+       -o [PATH TO RESIZED TFRECORD VALIDATION DATASET] \
+       --subset_name validation \
+       --num_preprocess_threads 60 \
+       --num_intra_threads 2 \
+       --num_inter_threads 2
 ```
 
 
