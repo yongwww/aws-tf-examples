@@ -25,7 +25,7 @@ Changelog:
   - Add loss scaling.
   - Scale resnet learning rate by batch size.
 1.0
-  - Initial version based on nvcnn.py 1.4
+  - Initial version
 """
 
 from __future__ import print_function

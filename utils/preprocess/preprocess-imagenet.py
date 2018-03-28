@@ -108,7 +108,7 @@ def download_dataset(raw_data_dir):
   tf.logging.info('Downloading the training set. This may take a few hours.')
   directory = os.path.join(raw_data_dir, TRAINING_DIRECTORY)
   filename = os.path.join(raw_data_dir, TRAINING_FILE)
-  #_download(BASE_URL + TRAINING_FILE, filename)
+  _download(BASE_URL + TRAINING_FILE, filename)
 
   # The training tarball contains multiple tar balls inside it. Extract them
   # in order to create a clean directory structure.
@@ -116,20 +116,20 @@ def download_dataset(raw_data_dir):
     subdirectory = os.path.join(directory, member.name.split('.')[0])
     sub_tarfile = os.path.join(subdirectory, member.name)
 
-    #_untar_file(filename, subdirectory, member)
-    #_untar_file(sub_tarfile, subdirectory)
-    #os.remove(sub_tarfile)
+    _untar_file(filename, subdirectory, member)
+    _untar_file(sub_tarfile, subdirectory)
+    os.remove(sub_tarfile)
 
   # Download synset_labels for validation set
   tf.logging.info('Downloading the validation labels.')
-  #_download(LABELS_URL, os.path.join(raw_data_dir, LABELS_FILE))
+  _download(LABELS_URL, os.path.join(raw_data_dir, LABELS_FILE))
 
   # Download the validation data
   tf.logging.info('Downloading the validation set. This may take a few hours.')
   directory = os.path.join(raw_data_dir, VALIDATION_DIRECTORY)
   filename = os.path.join(raw_data_dir, VALIDATION_FILE)
-  #_download(BASE_URL + VALIDATION_FILE, filename)
-  #_untar_file(filename, directory)
+  _download(BASE_URL + VALIDATION_FILE, filename)
+  _untar_file(filename, directory)
 
 
 def _int64_feature(value):
@@ -434,7 +434,7 @@ def main(argv):  # pylint: disable=unused-argument
   tf.logging.set_verbosity(tf.logging.INFO)
 
   if FLAGS.local_scratch_dir is None:
-    pass#raise ValueError('Scratch directory path must be provided.')
+    raise ValueError('Scratch directory path must be provided.')
 
   # Download the dataset if it is not present locally
   raw_data_dir = FLAGS.raw_data_dir
