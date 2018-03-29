@@ -16,6 +16,9 @@
 
 """
 Changelog:
+1.6
+  - Fixed scalar warning
+
 1.5
   - Ignore (with warning) --fp16 flag for inference
   - Use only single GPU for inference.
@@ -63,7 +66,8 @@ try:
     have_nccl = True
 except ImportError:
     have_nccl = False
-    print("WARNING: NCCL support not available")
+    print("WARNING: NCCL support is not available")
+tf.logging.set_verbosity(tf.logging.INFO) # DEBUG
 
 import sys
 import os
@@ -607,7 +611,7 @@ class FeedForwardTrainer(object):
                     gpucopy_op, (images, labels) = stage([images, labels])
                     gpucopy_ops.append(gpucopy_op)
                 else:
-                    input_shape = [self.image_preprocessor.batch, 
+                    input_shape = [self.image_preprocessor.batch,
                                    self.image_preprocessor.height,
                                    self.image_preprocessor.width,
                                    3]
@@ -668,11 +672,11 @@ class FeedForwardTrainer(object):
             with tf.control_dependencies([avg_op]):
                 total_loss     = tf.identity(total_loss)
                 total_loss_avg = tf.identity(total_loss_avg)
-            tf.summary.scalar('total loss raw', total_loss)
-            tf.summary.scalar('total loss avg', total_loss_avg)
-            tf.summary.scalar('train accuracy top-1 %', 100.*total_top1)
-            tf.summary.scalar('train accuracy top-5 %', 100.*total_top5)
-            tf.summary.scalar('learning rate', self.learning_rate)
+            tf.summary.scalar('total_loss_raw', total_loss)
+            tf.summary.scalar('total_loss_avg', total_loss_avg)
+            tf.summary.scalar('Top-1_accuracy', 100.*total_top1)
+            tf.summary.scalar('Top-5_accuracy', 100.*total_top5)
+            tf.summary.scalar('learning_rate', self.learning_rate)
         tower_gradvars = all_avg_gradients(tower_gradvars, devices)
 
         for grad, var in tower_gradvars[0]:
@@ -968,7 +972,7 @@ def resnet_bottleneck_v1(net, input_layer, depth, depth_bottleneck, stride,
         with net.jit_scope():
             x = net.activate(x + shortcut)
         return x
-    
+
 def resnext_split_branch(net, input_layer, stride):
     x = input_layer
     with tf.name_scope('resnext_split_branch'):
@@ -1043,7 +1047,7 @@ def inference_resnet_v1(net, input_layer, nlayer):
     elif nlayer == 152: return inference_resnet_v1_impl(net, input_layer, [3,8,36,3])
     else: raise ValueError("Invalid nlayer (%i); must be one of: 18,34,50,101,152" %
                            nlayer)
-        
+
 def inference_resnext_v1(net, input_layer, nlayer):
     """Aggregated  Residual Networks family of models
     https://arxiv.org/abs/1611.05431
@@ -1053,7 +1057,7 @@ def inference_resnext_v1(net, input_layer, nlayer):
     net.shortcut_type = 'B'
     assert net.cardinality in cardinality_to_bottleneck_width.keys(), \
     "Invalid  cardinality (%i); must be one of: 1,2,4,8,32" % net.cardinality
-    net.bottleneck_width = cardinality_to_bottleneck_width[net.cardinality]  
+    net.bottleneck_width = cardinality_to_bottleneck_width[net.cardinality]
     if nlayer ==  50: return inference_resnext_v1_impl(net, input_layer, [3,4, 6,3])
     elif nlayer == 101: return inference_resnext_v1_impl(net, input_layer, [3,4,23,3])
     elif nlayer == 152: return inference_resnext_v1_impl(net, input_layer, [3,8,36,3])
@@ -1312,7 +1316,7 @@ def main():
     tfversion = tensorflow_version_tuple()
     print("TensorFlow:  %i.%i.%s" % tfversion)
     print("This script:", __file__, "v%s" % __version__)
-    print("Cmd line args:")
+    print("Parameters specified:")
     print('\n'.join(['  '+arg for arg in sys.argv[1:]]))
 
     if FLAGS.data_dir is not None and FLAGS.data_dir != '':
@@ -1331,16 +1335,14 @@ def main():
     FLAGS.input_buffer_size     = min(10000, nrecord)
     FLAGS.distort_color         = False
     FLAGS.nstep_burnin          = 20
-    # Scaling to avoid fp16 underflow
-    #*FLAGS.loss_scale            = (1 << 7) if FLAGS.fp16 else 1
-    FLAGS.loss_scale            = 256. # TODO: May need to decide this based on model
+    FLAGS.loss_scale            = 256. # Neet to tune with model/dataset
     FLAGS.LARC_eta              = 0.003
     FLAGS.LARC_epsilon          = 1.
     FLAGS.LARC_mode             = 'clip'
 
     model_dtype = tf.float16 if FLAGS.fp16 else tf.float32
 
-    print("Num images: ", nrecord if FLAGS.data_dir is not None else 'Synthetic')
+    print("Num of images: ", nrecord if FLAGS.data_dir is not None else 'Synthetic')
     print("Model:      ", FLAGS.model)
     print("Batch size: ", total_batch_size, 'global')
     print("            ", total_batch_size/len(devices), 'per device')
