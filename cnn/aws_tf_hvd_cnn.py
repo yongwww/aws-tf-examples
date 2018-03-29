@@ -16,6 +16,8 @@
 
 """
 Changelog:
+1.2
+  - Add logging to file and console
 1.1
   - Center crop evaluation images
   - Enable LARC learning rate control
@@ -40,6 +42,7 @@ import sys
 import os
 import time
 import math
+import logging
 from collections import defaultdict
 import argparse
 
@@ -1150,15 +1153,35 @@ def main():
             print("ERROR: Unknown command line arg: %s" % bad_arg)
         raise ValueError("Invalid command line arg(s)")
 
+    if not os.path.exists(FLAGS.log_dir):
+        os.makedirs(FLAGS.log_dir)
+
+    # create logger with 'aws-tf-cnn'
+    logger = logging.getLogger('aws-tf-hvd-cnn')
+    logger.setLevel(logging.DEBUG)  # INFO, ERROR
+    # file handler which logs debug messages
+    fh = logging.FileHandler(os.path.join(FLAGS.log_dir, 'aws-tf-hvd-cnn.log'))
+    fh.setLevel(logging.DEBUG)
+    # console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    # add formatter to the handlers
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+    # add handlers to logger
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
     nclass = 1000
     batch_size = FLAGS.batch_size
     subset = 'validation' if FLAGS.eval else 'train'
 
     tfversion = tensorflow_version_tuple()
-    print_r0("TensorFlow:  %i.%i.%s" % tfversion)
-    print_r0("This script:", __file__, "v%s" % __version__)
-    print_r0("Cmd line args:")
-    print_r0('\n'.join(['  '+arg for arg in sys.argv[1:]]))
+    logger.info("TensorFlow:  %i.%i.%s" % tfversion)
+    logger.info("This script: {} v{}".format(__file__, __version__))
+    logger.info("Parameters specified:")
+    logger.info('\n'.join(['  '+arg for arg in sys.argv[1:]]))
 
     if FLAGS.data_dir is not None and FLAGS.data_dir != '':
         nrecord = get_num_records(os.path.join(FLAGS.data_dir, '%s-*' % subset))
@@ -1183,16 +1206,17 @@ def main():
 
     model_dtype = tf.float16 if FLAGS.fp16 else tf.float32
 
-    print_r0("Num ranks:  ", hvd.size())
-    print_r0("Num images: ", nrecord if FLAGS.data_dir is not None else 'Synthetic')
-    print_r0("Model:      ", FLAGS.model)
-    print_r0("Batch size: ", batch_size, 'per device')
-    print_r0("            ", batch_size * hvd.size(), 'total')
-    print_r0("Data format:", 'NCHW')
-    print_r0("Data type:  ", 'fp16' if model_dtype == tf.float16 else 'fp32')
+    logger.info("Num ranks:  {}".format(hvd.size()))
+    logger.info("Num of images: {}".format(nrecord)) if FLAGS.data_dir is not None else logger.info('Synthetic')
+    logger.info("Model: {}".format(FLAGS.model))
+    logger.info("Total batch size: {}".format(batch_size * hvd.size()))
+    logger.info("{}, per device".format(batch_size))
+    logger.info("Data format: 'NCHW'")
+    logger.info("Data type:  fp16") if model_dtype == tf.float16 else logger.info('Data type:  fp32')
 
     if FLAGS.num_epochs is not None:
         if FLAGS.data_dir is None:
+            logger.error("num_epochs requires data_dir to be specified")
             raise ValueError("num_epochs requires data_dir to be specified")
         nstep = nrecord * FLAGS.num_epochs // (batch_size * hvd.size())
     else:
@@ -1245,6 +1269,7 @@ def main():
         model_func = inference_inception_resnet_v2
         FLAGS.learning_rate = 0.045
     else:
+        logger.error("Invalid model type: {}".format(model_name))
         raise ValueError("Invalid model type: %s" % model_name)
 
     if FLAGS.data_dir is None:
@@ -1286,22 +1311,25 @@ def main():
 
     if FLAGS.eval:
         if FLAGS.data_dir is None:
+            logger.error("eval requires data_dir to be specified")
             raise ValueError("eval requires data_dir to be specified")
         if FLAGS.fp16:
+            logger.error("eval cannot be run with in fp16")
             raise ValueError("eval cannot be run with in fp16")
         if hvd.size() > 1:
+            logger.error("Multi-GPU evaluation is not supported")
             raise ValueError("Multi-GPU evaluation is not supported")
         evaluator = FeedForwardEvaluator(preprocessor, eval_func)
-        print("Building evaluation graph")
+        logger.info("Building evaluation graph")
         top1_op, top5_op, enqueue_ops = evaluator.evaluation_step(batch_size)
     else:
         nstep_per_epoch = nrecord // (batch_size * hvd.size())
         trainer = FeedForwardTrainer(preprocessor, loss_func, nstep_per_epoch)
-        print_r0("Building training graph")
+        logger.info("Building training graph")
         total_loss, learning_rate, train_ops = trainer.training_step(
             batch_size)
 
-    print_r0("Creating session")
+    logger.info("Creating session")
     config = tf.ConfigProto()
     config.intra_op_parallelism_threads = 1
     config.inter_op_parallelism_threads = 10
@@ -1322,7 +1350,7 @@ def main():
         last_save_time = time.time()
 
     if not FLAGS.eval:
-        print_r0("Initializing variables")
+        logger.info("Initializing variables")
         trainer.init(sess)
 
     restored = False
@@ -1332,16 +1360,17 @@ def main():
         if ckpt and ckpt.model_checkpoint_path:
             saver.restore(sess, ckpt.model_checkpoint_path)
             restored = True
-            print("Restored session from checkpoint " + ckpt.model_checkpoint_path)
+            logger.info("Restored session from checkpoint " + ckpt.model_checkpoint_path)
         else:
             if not os.path.exists(log_dir):
                 os.mkdir(log_dir)
 
     if FLAGS.eval:
         if not restored:
+            logger.error("No checkpoint found for evaluation")
             raise ValueError("No checkpoint found for evaluation")
         else:
-            print("Pre-filling input pipeline")
+            logger.info("Pre-filling input pipeline")
             evaluator.prefill_pipeline(sess)
             nstep = nrecord // batch_size
             run_evaluation(nstep, sess, top1_op, top5_op, enqueue_ops)
@@ -1354,11 +1383,11 @@ def main():
             save_path = saver.save(sess, checkpoint_file, global_step=0)
             print("Checkpoint written to", save_path)
 
-    print_r0("Pre-filling input pipeline")
+    logger.info("Pre-filling input pipeline")
     trainer.prefill_pipeline(sess)
 
-    print_r0("Training")
-    print_r0("  Step Epoch Img/sec   Loss   LR")
+    logger.info("Training")
+    logger.info("  Step Epoch Img/sec   Loss   LR")
     batch_times = []
     oom = False
     step0 = int(sess.run(trainer.global_step))
@@ -1371,14 +1400,14 @@ def main():
                  time.time() - last_summary_time > FLAGS.summary_interval)):
                 if step != 0:
                     last_summary_time += FLAGS.summary_interval
-                print("Writing summaries to ", log_dir)
+                logger.info("Writing summaries to {}".format(log_dir))
                 summary, loss, lr = sess.run([summary_ops] + ops_to_run)[:3]
                 train_writer.add_summary(summary, step)
             else:
                 loss, lr = sess.run(ops_to_run)[:2]
             elapsed = time.time() - start_time
         except KeyboardInterrupt:
-            print("Keyboard interrupt")
+            logger.info("Keyboard interrupt")
             break
         except tf.errors.ResourceExhaustedError:
             elapsed = -1.
@@ -1399,7 +1428,7 @@ def main():
         effective_accuracy = 100. / math.exp(min(loss,20.))
         if step == 0 or (step+1) % FLAGS.display_every == 0:
             epoch = step*batch_size*hvd.size() // nrecord
-            print_r0("%6i %5i %7.1f %7.3f %7.5f" % (
+            logger.info("%6i %5i %7.1f %7.3f %7.5f" % (
                 step+1, epoch+1, img_per_sec*hvd.size(), loss, lr))
         if oom:
             break
@@ -1414,12 +1443,12 @@ def main():
             speed_uncertainty = float('nan')
         speed_madstd = 1.4826*np.median(np.abs(speeds - np.median(speeds)))
         speed_jitter = speed_madstd
-        print_r0('-' * 64)
-        print_r0('Images/sec: %.1f +/- %.1f (jitter = %.1f)' % (
+        logger.info('-' * 64)
+        logger.info('Images/sec: %.1f +/- %.1f (jitter = %.1f)' % (
             speed_mean, speed_uncertainty, speed_jitter))
-        print_r0('-' * 64)
+        logger.info('-' * 64)
     else:
-        print_r0("No results, did not get past burn-in phase (%i steps)" %
+        logger.info("No results, did not get past burn-in phase (%i steps)" %
               FLAGS.nstep_burnin)
 
     if train_writer is not None:

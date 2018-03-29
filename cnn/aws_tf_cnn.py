@@ -1313,6 +1313,9 @@ def main():
             print("Warning: eval supports only fp32 math. Ignoring --fp16 flag.")
             FLAGS.fp16 = False
 
+    if not os.path.exists(FLAGS.log_dir):
+        os.makedirs(FLAGS.log_dir)
+
     # create logger with 'aws-tf-cnn'
     logger = logging.getLogger('aws-tf-cnn')
     logger.setLevel(logging.DEBUG)  # INFO, ERROR
