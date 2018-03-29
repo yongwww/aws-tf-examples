@@ -18,6 +18,7 @@
 Changelog:
 1.6
   - Fixed scalar warning
+  - Added logging to output log to file
 
 1.5
   - Ignore (with warning) --fp16 flag for inference
@@ -73,6 +74,7 @@ import sys
 import os
 import time
 import math
+import logging
 from collections import defaultdict
 import argparse
 
@@ -1187,6 +1189,7 @@ def inference_inception_resnet_v2(net, input_layer):
     return x
 
 def run_evaluation(nstep, sess, top1_op, top5_op, enqueue_ops):
+
     print("Evaluating")
     top1s = []
     top5s = []
@@ -1259,7 +1262,7 @@ def main():
                          alexnet, googlenet, vgg[11,13,16,19],
                          inception[3,4], resnet[18,34,50,101,152],
                          resnext[50,101,152], inception-resnet2.""")
-    cmdline.add_argument('--data_dir', default=None,
+    cmdline.add_argument('-d', '--data_dir', default=None,
                          help="""Path to dataset in TFRecord format
                          (aka Example protobufs). Files should be
                          named 'train-*' and 'validation-*'.""")
@@ -1288,23 +1291,44 @@ def main():
     add_bool_argument(cmdline, '--fp16',
                       help="""Train using float16 (half) precision instead
                       of float32.""")
+
+
     global FLAGS
     FLAGS, unknown_args = cmdline.parse_known_args()
     if len(unknown_args) > 0:
         for bad_arg in unknown_args:
-            print("ERROR: Unknown command line arg: %s" % bad_arg)
-        raise ValueError("Invalid command line arg(s)")
+            #print("ERROR: Unknown arg: %s" % bad_arg)
+            print("Error: Unknown arg: %s" % bad_arg)
+        print("Error: Invalid arg(s)")
+        raise ValueError("Invalid arg(s)")
 
     FLAGS.strong_scaling = False
     FLAGS.nccl           = True
     FLAGS.xla            = False
     if FLAGS.eval:
         if FLAGS.num_gpus != 1:
-            print("WARNING: eval always runs on a single GPU. Ignoring --num_gpus flag.")
+            print("Warning: eval always runs on a single GPU. Ignoring --num_gpus flag.")
             FLAGS.num_gpus=1
         if FLAGS.fp16:
-            print("WARNING: eval supports only fp32 math. Ignoring --fp16 flag.")
+            print("Warning: eval supports only fp32 math. Ignoring --fp16 flag.")
             FLAGS.fp16 = False
+
+    # create logger with 'aws-tf-cnn'
+    logger = logging.getLogger('aws-tf-cnn')
+    logger.setLevel(logging.DEBUG)  # INFO, ERROR
+    # file handler which logs debug messages
+    fh = logging.FileHandler(os.path.join(FLAGS.log_dir, 'aws-tf-cnn.log'))
+    fh.setLevel(logging.DEBUG)
+    # console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    # add formatter to the handlers
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+    # add handlers to logger
+    logger.addHandler(fh)
+    logger.addHandler(ch)
 
     nclass = 1000
     total_batch_size = FLAGS.batch_size
@@ -1314,10 +1338,10 @@ def main():
     subset = 'validation' if FLAGS.eval else 'train'
 
     tfversion = tensorflow_version_tuple()
-    print("TensorFlow:  %i.%i.%s" % tfversion)
-    print("This script:", __file__, "v%s" % __version__)
-    print("Parameters specified:")
-    print('\n'.join(['  '+arg for arg in sys.argv[1:]]))
+    logger.info("TensorFlow:  %i.%i.%s" % tfversion)
+    logger.info("This script: {} v{}".format(__file__, __version__))
+    logger.info("Parameters specified:")
+    logger.info('\n'.join(['  '+arg for arg in sys.argv[1:]]))
 
     if FLAGS.data_dir is not None and FLAGS.data_dir != '':
         nrecord = get_num_records(os.path.join(FLAGS.data_dir, '%s-*' % subset))
@@ -1342,19 +1366,22 @@ def main():
 
     model_dtype = tf.float16 if FLAGS.fp16 else tf.float32
 
-    print("Num of images: ", nrecord if FLAGS.data_dir is not None else 'Synthetic')
-    print("Model:      ", FLAGS.model)
-    print("Batch size: ", total_batch_size, 'global')
-    print("            ", total_batch_size/len(devices), 'per device')
-    print("Devices:    ", devices)
-    print("Data format:", 'NCHW')
-    print("Data type:  ", 'fp16' if model_dtype == tf.float16 else 'fp32')
-    print("Have NCCL:  ", have_nccl)
-    print("Using NCCL: ", FLAGS.nccl)
-    print("Using XLA:  ", FLAGS.xla)
-
+    logger.info("Num of images: {}".format(nrecord)) if FLAGS.data_dir is not None else logger.info('Synthetic')
+    logger.info("Model: {}".format(FLAGS.model))
+    logger.info("Global batch size: {}".format(total_batch_size))
+    logger.info("{}, per device".format(int(total_batch_size/len(devices))))
+    logger.info("Devices:  {}".format(devices))
+    logger.info("Data format: 'NCHW'")
+    logger.info("Data type:  fp16") if model_dtype == tf.float16 else logger.info('Data type:  fp32')
+    if have_nccl is not None:
+        logger.info("Have NCCL: {}".format(have_nccl))
+    if FLAGS.nccl is not None:
+        logger.info("Using NCCL: {}".format(FLAGS.nccl))
+    if FLAGS.xla is not None:
+        logger.info("Using XLA: {}".format(FLAGS.xla) )
     if FLAGS.num_epochs is not None:
         if FLAGS.data_dir is None:
+            logger.error("num_epochs requires data_dir to be specified")
             raise ValueError("num_epochs requires data_dir to be specified")
         nstep = nrecord * FLAGS.num_epochs // total_batch_size
     else:
@@ -1407,6 +1434,7 @@ def main():
         model_func = inference_inception_resnet_v2
         FLAGS.learning_rate = 0.045
     else:
+        logger.error("Invalid model type: %s" % model_name)
         raise ValueError("Invalid model type: %s" % model_name)
 
     if FLAGS.data_dir is None:
@@ -1451,21 +1479,23 @@ def main():
 
     if FLAGS.eval:
         if FLAGS.data_dir is None:
+            logger.error("eval requires data_dir to be specified")
             raise ValueError("eval requires data_dir to be specified")
         if FLAGS.fp16:
+            logger.error("eval cannot be run with in fp16")
             raise ValueError("eval cannot be run with in fp16")
         evaluator = FeedForwardEvaluator(preprocessor, eval_func)
-        print("Building evaluation graph")
+        logger.info("Building evaluation graph")
         top1_op, top5_op, enqueue_ops = evaluator.evaluation_step(
             total_batch_size, devices)
     else:
         nstep_per_epoch = nrecord // total_batch_size
         trainer = FeedForwardTrainer(preprocessor, loss_func, nstep_per_epoch)
-        print("Building training graph")
+        logger.info("Building training graph")
         total_loss, learning_rate, train_ops = trainer.training_step(
             total_batch_size, devices)
 
-    print("Creating session")
+    logger.info("Creating session")
     config = tf.ConfigProto()
     config.intra_op_parallelism_threads = 1
 
@@ -1489,33 +1519,34 @@ def main():
         if ckpt and ckpt.model_checkpoint_path:
             saver.restore(sess, ckpt.model_checkpoint_path)
             restored = True
-            print("Restored session from checkpoint " + ckpt.model_checkpoint_path)
+            logger.info("Restored session from checkpoint " + ckpt.model_checkpoint_path)
         else:
             if not os.path.exists(log_dir):
                 os.mkdir(log_dir)
 
     if FLAGS.eval:
         if not restored:
+            logger.error("No checkpoint found for evaluation")
             raise ValueError("No checkpoint found for evaluation")
         else:
-            print("Pre-filling input pipeline")
+            logger.info("Pre-filling input pipeline")
             evaluator.prefill_pipeline(sess)
             nstep = nrecord // total_batch_size
             run_evaluation(nstep, sess, top1_op, top5_op, enqueue_ops)
             return
 
     if not restored:
-        print("Initializing variables")
+        logger.info("Initializing variables")
         trainer.init(sess, devices)
         if saver is not None:
             save_path = saver.save(sess, checkpoint_file, global_step=0)
-            print("Checkpoint written to", save_path)
+            logger.info("Checkpoint written to", save_path)
 
-    print("Pre-filling input pipeline")
+    logger.info("Pre-filling input pipeline")
     trainer.prefill_pipeline(sess)
 
-    print("Training")
-    print("  Step Epoch Img/sec   Loss   LR")
+    logger.info("Training")
+    logger.info("  Step Epoch Img/sec   Loss   LR")
     batch_times = []
     oom = False
     step0 = int(sess.run(trainer.global_step))
@@ -1528,14 +1559,14 @@ def main():
                  time.time() - last_summary_time > FLAGS.summary_interval)):
                 if step != 0:
                     last_summary_time += FLAGS.summary_interval
-                print("Writing summaries to ", log_dir)
+                logger.info("Writing summaries to ", log_dir)
                 summary, loss, lr = sess.run([summary_ops] + ops_to_run)[:3]
                 train_writer.add_summary(summary, step)
             else:
                 loss, lr = sess.run(ops_to_run)[:2]
             elapsed = time.time() - start_time
         except KeyboardInterrupt:
-            print("Keyboard interrupt")
+            logger.info("Keyboard interrupt")
             break
         except tf.errors.ResourceExhaustedError:
             elapsed = -1.
@@ -1548,7 +1579,7 @@ def main():
             last_save_time += FLAGS.save_interval
             save_path = saver.save(sess, checkpoint_file,
                                    global_step=trainer.global_step)
-            print("Checkpoint written to", save_path)
+            logger.info("Checkpoint written to", save_path)
 
         if step >= FLAGS.nstep_burnin:
             batch_times.append(elapsed)
@@ -1556,7 +1587,7 @@ def main():
         effective_accuracy = 100. / math.exp(min(loss,20.))
         if step == 0 or (step+1) % FLAGS.display_every == 0:
             epoch = step*total_batch_size // nrecord
-            print("%6i %5i %7.1f %7.3f %7.5f" % (
+            logger.info("%6i %5i %7.1f %7.3f %7.5f" % (
                 step+1, epoch+1, img_per_sec, loss, lr))
         if oom:
             break
@@ -1571,19 +1602,19 @@ def main():
             speed_uncertainty = float('nan')
         speed_madstd = 1.4826*np.median(np.abs(speeds - np.median(speeds)))
         speed_jitter = speed_madstd
-        print('-' * 64)
-        print('Images/sec: %.1f +/- %.1f (jitter = %.1f)' % (
+        logger.info('-' * 64)
+        logger.info('Images/sec: %.1f +/- %.1f (jitter = %.1f)' % (
             speed_mean, speed_uncertainty, speed_jitter))
-        print('-' * 64)
+        logger.info('-' * 64)
     else:
-        print("No results, did not get past burn-in phase (%i steps)" %
+        logger.info("No results, did not get past burn-in phase (%i steps)" %
               FLAGS.nstep_burnin)
 
     if train_writer is not None:
         train_writer.close()
 
     if oom:
-        print("Out of memory error detected, exiting")
+        logger.error("Out of memory error detected, exiting")
         sys.exit(-2)
 
 if __name__ == '__main__':

@@ -40,7 +40,7 @@ python ./cnn/aws_tf_cnn.py
       --display_every 100 \
       --data_dir=[PATH TO TFRECORD TRAINING DATASET] \
       --log_dir=[PATH TO CHECKPOINT DIR] \
-      -m resnet50 \
+      --model=resnet50 \
       --num_gpus=8 \
       --fp16
 ```
@@ -52,7 +52,7 @@ python ./cnn/aws_tf_cnn.py
       --display_every 100 \
       --data_dir=[PATH TO TFRECORD VALIDAGTION DATASET] \
       --log_dir=[PATH TO CHECKPOINT DIR] \
-      -m resnet50 \
+      --model=resnet50 \
       --num_gpus=8 \
       --fp16 \
       --eval

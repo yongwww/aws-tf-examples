@@ -537,11 +537,11 @@ class FeedForwardTrainer(object):
             with tf.control_dependencies([avg_op]):
                 total_loss     = tf.identity(loss)
                 total_loss_avg = tf.identity(loss_avg)
-            tf.summary.scalar('total loss raw', total_loss)
-            tf.summary.scalar('total loss avg', total_loss_avg)
-            tf.summary.scalar('train accuracy top-1 %', 100.*top1)
-            tf.summary.scalar('train accuracy top-5 %', 100.*top5)
-            tf.summary.scalar('learning rate', self.learning_rate)
+            tf.summary.scalar('total_loss_raw', total_loss)
+            tf.summary.scalar('total_loss_avg', total_loss_avg)
+            tf.summary.scalar('Top-1_accuracy', 100.*top1)
+            tf.summary.scalar('Top-5_accuracy', 100.*top5)
+            tf.summary.scalar('learning_rate', self.learning_rate)
 
         # Apply the gradients to optimize the loss function
         with tf.device('/gpu:0'):
