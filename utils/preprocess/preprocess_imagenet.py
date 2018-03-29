@@ -22,7 +22,7 @@ username and access_key.
 Make sure you have around 300GB of disc space available on the machine where
 you're running this script. You can run the script using the following command.
 ```
-python preprocess-imagenet.py \
+python preprocess_imagenet.py \
   --local_scratch_dir="./imagenet" \
   --imagenet_username=FILL_ME_IN \
   --imagenet_access_key=FILL_ME_IN \

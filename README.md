@@ -1,15 +1,15 @@
 # aws-tf-examples
 ### Prepare tfrecords ImageNet dataset
-In order to download imagenet dataset, you should create an ImageNet account via [http://image-net.org](http://image-net.org). Then you will have your account and access key.
+In order to download imagenet dataset, you are supposed to get your imagenet account and access key via [http://image-net.org](http://image-net.org).
 
-1. Download and untar imagenet dataset, generate TFRecords format dataset without changing the image size <br>
+1. Download and untar imagenet raw dataset, generate TFRecords format dataset without changing the image size <br>
 ```
-   python ./utils/preprocess/preprocess-imagenet.py \
+   python ./utils/preprocess/preprocess_imagenet.py \
         --local_scratch_dir=[YOUR DIRECTORY] \
-        --imagenet_username=[imagenet account \
+        --imagenet_username=[imagenet account] \
         --imagenet_access_key=[imagenet access key]
 ```
-2. Resize to 480px shortest size using script *tensorflow_image_resizer.py*
+2. Resize image to 480px shortest side, maintaining original aspect ratio
 
 ```
   python ./utils/preprocess/tensorflow_image_resizer.py -d imagenet \
@@ -31,7 +31,7 @@ In order to download imagenet dataset, you should create an ImageNet account via
 
 ### Train model using the prepared dataset
 
-#### Train and evluate without Horovod support
+#### Train and evaluate without Horovod support
 -  Train
 ```
 python ./cnn/aws_tf_cnn.py
@@ -59,7 +59,7 @@ python ./cnn/aws_tf_cnn.py
 ```
 
 #### Train and evluate with Horovod support
-We recommend you to install horovod and used horovod based script to train, which could speed up the training. Please follow the [guide](https://github.com/uber/horovod/blob/master/docs/gpus.md) to enable Horovod.
+We recommend installing horovod and using the horovod based script to train for a better performance.(Please follow the [guide](https://github.com/uber/horovod/blob/master/docs/gpus.md) to enable Horovod) The rankfile and hostfile are used to help pin CPUs to the socket near the appropriate GPU, you should modify them based on your specific computation environment. 
 
 - Train
 ```
