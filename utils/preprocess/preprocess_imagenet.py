@@ -108,7 +108,8 @@ def download_dataset(raw_data_dir):
   tf.logging.info('Downloading the training set. This may take a few hours.')
   directory = os.path.join(raw_data_dir, TRAINING_DIRECTORY)
   filename = os.path.join(raw_data_dir, TRAINING_FILE)
-  _download(BASE_URL + TRAINING_FILE, filename)
+  if not os.path.isfile(filename):
+      _download(BASE_URL + TRAINING_FILE, filename)
 
   # The training tarball contains multiple tar balls inside it. Extract them
   # in order to create a clean directory structure.
@@ -128,7 +129,8 @@ def download_dataset(raw_data_dir):
   tf.logging.info('Downloading the validation set. This may take a few hours.')
   directory = os.path.join(raw_data_dir, VALIDATION_DIRECTORY)
   filename = os.path.join(raw_data_dir, VALIDATION_FILE)
-  _download(BASE_URL + VALIDATION_FILE, filename)
+  if not os.path.isfile(filename):
+      _download(BASE_URL + VALIDATION_FILE, filename)
   _untar_file(filename, directory)
 
 
