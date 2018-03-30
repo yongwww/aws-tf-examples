@@ -1355,15 +1355,15 @@ def main():
 
     restored = False
     if hvd.rank() == 0 and saver is not None:
-        ckpt = tf.train.get_checkpoint_state(log_dir)
-        checkpoint_file = os.path.join(log_dir, "checkpoint")
+        ckpt = tf.train.get_checkpoint_state(FLAGS.log_dir)
+        checkpoint_file = os.path.join(FLAGS.log_dir, "checkpoint")
         if ckpt and ckpt.model_checkpoint_path:
             saver.restore(sess, ckpt.model_checkpoint_path)
             restored = True
-            logger.info("Restored session from checkpoint " + ckpt.model_checkpoint_path)
+            logger.info("Restored session from checkpoint {}".format(ckpt.model_checkpoint_path))
         else:
-            if not os.path.exists(log_dir):
-                os.mkdir(log_dir)
+            if not os.path.exists(FLAGS.log_dir):
+                os.mkdir(FLAGS.log_dir)
 
     if FLAGS.eval:
         if not restored:
@@ -1385,7 +1385,7 @@ def main():
 
     logger.info("Pre-filling input pipeline")
     trainer.prefill_pipeline(sess)
-
+    logger.info("Writing summaries to {}".format(FLAGS.log_dir))
     logger.info("Training")
     logger.info("  Step Epoch Img/sec   Loss   LR")
     batch_times = []
@@ -1400,7 +1400,6 @@ def main():
                  time.time() - last_summary_time > FLAGS.summary_interval)):
                 if step != 0:
                     last_summary_time += FLAGS.summary_interval
-                logger.info("Writing summaries to {}".format(log_dir))
                 summary, loss, lr = sess.run([summary_ops] + ops_to_run)[:3]
                 train_writer.add_summary(summary, step)
             else:

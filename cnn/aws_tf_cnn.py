@@ -1345,7 +1345,6 @@ def main():
     logger.info("This script: {} v{}".format(__file__, __version__))
     logger.info("Parameters specified:")
     logger.info('\n'.join(['  '+arg for arg in sys.argv[1:]]))
-
     if FLAGS.data_dir is not None and FLAGS.data_dir != '':
         nrecord = get_num_records(os.path.join(FLAGS.data_dir, '%s-*' % subset))
     else:
@@ -1437,7 +1436,7 @@ def main():
         model_func = inference_inception_resnet_v2
         FLAGS.learning_rate = 0.045
     else:
-        logger.error("Invalid model type: %s" % model_name)
+        logger.error("Invalid model type: {}".format(model_name))
         raise ValueError("Invalid model type: %s" % model_name)
 
     if FLAGS.data_dir is None:
@@ -1517,15 +1516,15 @@ def main():
 
     restored = False
     if saver is not None:
-        ckpt = tf.train.get_checkpoint_state(log_dir)
-        checkpoint_file = os.path.join(log_dir, "checkpoint")
+        ckpt = tf.train.get_checkpoint_state(FLAGS.log_dir)
+        checkpoint_file = os.path.join(FLAGS.log_dir, "checkpoint")
         if ckpt and ckpt.model_checkpoint_path:
             saver.restore(sess, ckpt.model_checkpoint_path)
             restored = True
-            logger.info("Restored session from checkpoint " + ckpt.model_checkpoint_path)
+            logger.info("Restored session from checkpoint {}".format(ckpt.model_checkpoint_path))
         else:
-            if not os.path.exists(log_dir):
-                os.mkdir(log_dir)
+            if not os.path.exists(FLAGS.log_dir):
+                os.mkdir(FLAGS.log_dir)
 
     if FLAGS.eval:
         if not restored:
@@ -1543,12 +1542,13 @@ def main():
         trainer.init(sess, devices)
         if saver is not None:
             save_path = saver.save(sess, checkpoint_file, global_step=0)
-            logger.info("Checkpoint written to", save_path)
+            logger.info("Checkpoint written to {}".format(save_path))
 
     logger.info("Pre-filling input pipeline")
     trainer.prefill_pipeline(sess)
 
     logger.info("Training")
+    logger.info("Writing summaries to {}".format(FLAGS.log_dir))
     logger.info("  Step Epoch Img/sec   Loss   LR")
     batch_times = []
     oom = False
@@ -1562,7 +1562,6 @@ def main():
                  time.time() - last_summary_time > FLAGS.summary_interval)):
                 if step != 0:
                     last_summary_time += FLAGS.summary_interval
-                logger.info("Writing summaries to ", log_dir)
                 summary, loss, lr = sess.run([summary_ops] + ops_to_run)[:3]
                 train_writer.add_summary(summary, step)
             else:
@@ -1582,7 +1581,7 @@ def main():
             last_save_time += FLAGS.save_interval
             save_path = saver.save(sess, checkpoint_file,
                                    global_step=trainer.global_step)
-            logger.info("Checkpoint written to", save_path)
+            logger.info("Checkpoint written to {}".format(save_path))
 
         if step >= FLAGS.nstep_burnin:
             batch_times.append(elapsed)
@@ -1610,8 +1609,7 @@ def main():
             speed_mean, speed_uncertainty, speed_jitter))
         logger.info('-' * 64)
     else:
-        logger.info("No results, did not get past burn-in phase (%i steps)" %
-              FLAGS.nstep_burnin)
+        logger.info("No results, did not get past burn-in phase ({} steps)".format(FLAGS.nstep_burnin))
 
     if train_writer is not None:
         train_writer.close()
