@@ -29,7 +29,7 @@ python preprocess_imagenet.py \
 ```
 
 Optionally if the raw data has already been downloaded you can provide a direct
-`raw_data_directory` path. If raw data directory is provided it should be in
+`raw_data_dir` path. If raw data directory is provided it should be in
 the format:
 - Training images: train/n03062245/n03062245_4620.JPEG
 - Validation Images: validation/ILSVRC2012_val_00000001.JPEG
