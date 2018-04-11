@@ -58,7 +58,7 @@ python ./cnn/aws_tf_cnn.py
       --eval
 ```
 
-#### Train and evluate with Horovod support
+#### Train and evaluate with Horovod support
 We recommend installing horovod and using the horovod based script to train for a better performance.(Please follow the [guide](https://github.com/uber/horovod/blob/master/docs/gpus.md) to enable Horovod) The rankfile and hostfile are used to help pin CPUs to the socket near the appropriate GPU, you should modify them based on your specific computation environment. 
 
 - Train
