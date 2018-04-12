@@ -1107,6 +1107,7 @@ def add_bool_argument(cmdline, shortname, longname=None, default=False, help=Non
     return cmdline
 
 def main():
+    global_start_time = time.time()
     tf.set_random_seed(1234+hvd.rank())
     np.random.seed(4321+hvd.rank())
     cmdline = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -1199,7 +1200,7 @@ def main():
     FLAGS.input_buffer_size     = min(10000, nrecord)
     FLAGS.distort_color         = False
     FLAGS.nstep_burnin          = 20
-    FLAGS.loss_scale            = 10. # TODO: May need to decide this based on model
+    FLAGS.loss_scale            = 256. # TODO: May need to decide this based on model
     FLAGS.LARC_eta              = 0.003
     FLAGS.LARC_epsilon          = 1.
     FLAGS.LARC_mode             = 'clip'
@@ -1452,6 +1453,10 @@ def main():
 
     if train_writer is not None:
         train_writer.close()
+
+    global_end_time = time.time()
+    #logger.info("start time is {}, end time is {}".format(global_start_time, global_end_time))
+    logger.info('Time used in total: %.1f seconds' % (global_end_time - global_start_time))
 
     if oom:
         print("Out of memory error detected, exiting")
