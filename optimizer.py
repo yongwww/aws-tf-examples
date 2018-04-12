@@ -1315,7 +1315,7 @@ def main():
             FLAGS.fp16 = False
 
     if not os.path.exists(FLAGS.log_dir):
-        os.mkdir(FLAGS.log_dir)
+        os.makedirs(FLAGS.log_dir)
 
     # create logger with 'aws-tf-cnn'
     logger = logging.getLogger('aws-tf-cnn')
@@ -1608,16 +1608,15 @@ def main():
         logger.info('-' * 64)
         logger.info('Images/sec: %.1f +/- %.1f (jitter = %.1f)' % (
             speed_mean, speed_uncertainty, speed_jitter))
-        logger.info('-' * 64)    
+        logger.info('-' * 64)
+        global_end_time = time.time()
+        logger.info('Time used in total: %.1f seconds' % (global_end_time - global_start_time))
+
     else:
         logger.info("No results, did not get past burn-in phase ({} steps)".format(FLAGS.nstep_burnin))
 
     if train_writer is not None:
         train_writer.close()
-
-    global_end_time = time.time()
-    #logger.info("start time is {}, end time is {}".format(global_start_time, global_end_time))
-    logger.info('Time used in total: %.1f seconds' % (global_end_time - global_start_time))
 
     if oom:
         logger.error("Out of memory error detected, exiting")
