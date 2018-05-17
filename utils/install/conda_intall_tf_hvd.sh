@@ -2,9 +2,9 @@
 # 
 # conda install tensorflow and horovod on AWS DLAMI
 #
-# usage: sh setup_tf_hvd.sh condaEnvName tfBinaryURL
+# usage: sh conda_install_tf_hvd.sh condaEnvName tfBinaryURL
 #
-# example: sh setup_tf_hvd.sh tensorflow_horovod  \
+# example: sh conda_install_tf_hvd.sh tensorflow_horovod  \
 #             https://storage.googleapis.com/tensorflow/linux/gpu/tensorflow_gpu-1.7.0-cp36-cp36m-linux_x86_64.whl
 
 
