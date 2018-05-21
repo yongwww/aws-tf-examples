@@ -1,0 +1,79 @@
+{
+  "CreateTensorFlowEnvs": [
+    {
+      "CreateTensorFlowP27Env": {
+        "script": "CondaDLAMIBuilder/build_scripts/create_conda_env.py",
+        "name": "tensorflow_p27",
+        "python_version": "2.7",
+        "mandatory_packages": "parameter_server.mandatory_packages",
+        "conda_packages_to_install": {
+          "-c conda-forge numpy": "1.14.3",
+          "-c conda-forge opencv": "3.4.1",
+          "-c conda-forge h5py": "2.7.1",
+          "-c conda-forge bazel": "0.11.1"
+        },
+        "pip_package_to_install": {
+          "https://storage.googleapis.com/tensorflow/linux/gpu/tensorflow_gpu-1.8.0-cp27-none-linux_x86_64.whl": null,
+          "keras": "2.1.6",
+          "--no-deps tensorflow-serving-api": "1.7.0",
+          "tensorboard": "1.8.0",
+          "grpcio": "1.10.1",
+          "horovod": null
+        },
+        "pip_package_to_remove": {
+          
+        },
+        "conda_package_to_remove": {
+          
+        },
+        "anaconda_home": "parameter_server.conda_home",
+        "cuda_version": "9.0",
+        "keras_backend_name": "tensorflow",
+        "python_path_value": null,
+        "ld_lib_path_value": null,
+        "env_variables": null,
+        "message": null,
+        "upload_activation_scripts": [
+          "uploadfiles/inferno/99_install_tf.sh"
+        ]
+      }
+    },
+    {
+      "CreateTensorFlowP36Env": {
+        "script": "CondaDLAMIBuilder/build_scripts/create_conda_env.py",
+        "name": "tensorflow_p36",
+        "python_version": "3.6",
+        "mandatory_packages": "parameter_server.mandatory_packages",
+        "conda_packages_to_install": {
+          "-c conda-forge numpy": "1.14.3",
+          "-c conda-forge opencv": "3.4.1",
+          "-c conda-forge h5py": "2.7.1",
+          "-c conda-forge bazel": "0.11.1"
+        },
+        "pip_package_to_install": {
+          "https://storage.googleapis.com/tensorflow/linux/gpu/tensorflow_gpu-1.8.0-cp36-cp36m-linux_x86_64.whl": null,
+          "keras": "2.1.6",
+          "tensorboard": "1.8.0",
+          "grpcio": "1.10.1",
+          "horovod": null
+        },
+        "pip_package_to_remove": {
+          
+        },
+        "conda_package_to_remove": {
+          
+        },
+        "anaconda_home": "parameter_server.conda_home",
+        "cuda_version": "9.0",
+        "keras_backend_name": "tensorflow",
+        "python_path_value": null,
+        "ld_lib_path_value": null,
+        "env_variables": null,
+        "message": null,
+        "upload_activation_scripts": [
+          "uploadfiles/inferno/99_install_tf.sh"
+        ]
+      }
+    }
+  ]
+}
