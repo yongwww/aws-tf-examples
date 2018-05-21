@@ -18,7 +18,7 @@
           "--no-deps tensorflow-serving-api": "1.7.0",
           "tensorboard": "1.8.0",
           "grpcio": "1.10.1",
-          "horovod": null
+          "horovod": "0.12.1"
         },
         "pip_package_to_remove": {
           
